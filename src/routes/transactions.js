@@ -128,6 +128,54 @@ function applyConfirmedPurchase(tenantId, tier, purchaseId) {
   if (tierHasFeature(tier, "accounting")) postPurchase(tenantId, purchase); // AC-01
 }
 
+/**
+ * Edit a purchase (admin/can_edit). A confirmed purchase has already moved stock,
+ * recomputed weighted-avg cost and posted the ledger, so we reverse those effects,
+ * replace the lines/totals, then re-apply — all in one transaction.
+ * NOTE: the avg-cost reversal is exact when this is the latest cost-affecting event
+ * for an item; later movements can leave the re-derived cost slightly shifted.
+ */
+router.put("/purchases/:id", requireFeature("purchases"), requirePermission("purchases", "edit"), (req, res) => {
+  const p = db.prepare("SELECT * FROM purchases WHERE id=? AND tenant_id=?").get(req.params.id, req.tenant.id);
+  if (!p) return res.status(404).json({ error: "Not found" });
+  const { vendor_id, doc_date, doc_type, paid, notes, lines } = req.body || {};
+  const type = doc_type === "return" ? "return" : "purchase";
+  const payAcct = req.body?.payment_account === "bank" ? "bank" : "cash";
+  if (!vendor_id) return res.status(400).json({ error: "vendor_id is required" });
+  if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: "At least one line is required" });
+
+  const newLocation = resolveLocation(req);
+  try {
+    db.transaction(() => {
+      const oldLines = db.prepare("SELECT * FROM purchase_lines WHERE purchase_id=?").all(p.id);
+      if (p.status === "confirmed") reversePurchaseEffects(req.tenant.id, req.tenant.tier, p, oldLines);
+
+      const totals = computeTotals(lines, req.tenant.tier);
+      const paidAmt = Math.min(num(paid), totals.grand);
+      db.prepare(
+        `UPDATE purchases SET vendor_id=?, doc_type=?, doc_date=?, subtotal=?, tax_total=?, grand_total=?, paid=?, notes=?, location_id=?, payment_account=? WHERE id=?`
+      ).run(vendor_id, type, doc_date || p.doc_date, totals.subtotal, totals.tax, totals.grand, paidAmt, notes || null, newLocation, payAcct, p.id);
+      db.prepare("DELETE FROM purchase_lines WHERE purchase_id=?").run(p.id);
+      for (const ln of totals.lines) {
+        db.prepare(`INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)`)
+          .run(p.id, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.line_total);
+      }
+      if (p.status === "confirmed") {
+        applyConfirmedPurchase(req.tenant.id, req.tenant.tier, p.id); // stock + cost + ledger
+        if (type === "purchase" && paidAmt > 0) {
+          db.prepare("INSERT INTO payments (tenant_id, kind, party_id, account, amount, pay_date, note) VALUES (?,?,?,?,?,?,?)")
+            .run(req.tenant.id, "payment", vendor_id, payAcct, paidAmt, doc_date || p.doc_date, `Paid against ${p.doc_no}`);
+        }
+      }
+    })();
+    logAction(req, "edit", "purchase", p.id);
+    res.json(db.prepare("SELECT * FROM purchases WHERE id=?").get(p.id));
+  } catch (e) {
+    if (e.httpStatus) return res.status(e.httpStatus).json({ error: e.message });
+    throw e;
+  }
+});
+
 /* ─────────────────────────── SALES (SA-01..06) ─────────────────────────── */
 
 router.get("/sales", requireFeature("sales"), (req, res) => {
@@ -168,9 +216,7 @@ router.post("/sales", requireFeature("sales"), requirePermission("sales", "creat
     const result = db.transaction(() => {
       const totals = computeTotals(lines, req.tenant.tier);
       const docNo = nextDocNo("sales", type === "return" ? "CN" : "INV", req.tenant.id);
-      const sign = type === "return" ? 1 : -1; // sale removes stock, return adds back
       const recv = Math.min(num(received), totals.grand); // never record more received than the invoice total
-      let cogs = 0;
       const s = db
         .prepare(
           `INSERT INTO sales (tenant_id, customer_id, doc_no, doc_type, doc_date, subtotal, tax_total, grand_total, received, cogs, notes, location_id, payment_account)
@@ -180,30 +226,11 @@ router.post("/sales", requireFeature("sales"), requirePermission("sales", "creat
           totals.subtotal, totals.tax, totals.grand, recv, 0, notes || null, locationId, payAcct);
 
       for (const ln of totals.lines) {
-        const item = db.prepare("SELECT * FROM items WHERE id=? AND tenant_id=?").get(ln.item_id, req.tenant.id);
-        if (!item) throw httpError(400, `Item ${ln.item_id} not found`);
-        if (type === "sale" && !allowOverride) {
-          // IN-06: validate against the issuing location (computed Main or warehouse)
-          const available = hasLoc(req.tenant.tier) && locationId ? qtyAt(req.tenant.id, item.id, locationId) : item.stock_qty;
-          if (ln.qty > available)
-            throw httpError(409, `Insufficient stock for ${item.name} (have ${available}, need ${ln.qty})`);
-        }
-
         db.prepare(
           `INSERT INTO sale_lines (sale_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)`
         ).run(s.lastInsertRowid, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.line_total);
-
-        const delta = sign * ln.qty;
-        db.prepare("UPDATE items SET stock_qty = stock_qty + ? WHERE id=?").run(delta, item.id);
-        if (hasLoc(req.tenant.tier) && locationId) adjustNamed(req.tenant.id, item.id, locationId, delta); // IN-06: issue from chosen warehouse
-        cogs += ln.qty * item.cost_price * (type === "sale" ? 1 : -1);
-        recordMovement(req.tenant.id, item.id, delta, type === "return" ? "sale_return" : "sale", "sale", s.lastInsertRowid);
       }
-      db.prepare("UPDATE sales SET cogs=? WHERE id=?").run(round(cogs), s.lastInsertRowid);
-      // AC-01: auto-post double-entry for Standard/Premium tenants
-      if (tierHasFeature(req.tenant.tier, "accounting")) {
-        postSale(req.tenant.id, db.prepare("SELECT * FROM sales WHERE id=?").get(s.lastInsertRowid));
-      }
+      applyConfirmedSale(req.tenant.id, req.tenant.tier, s.lastInsertRowid, allowOverride); // stock + COGS + ledger
       // Log the payment received at invoice time so it appears in Payments history
       // (informational — the ledger leg is already posted above; not re-allocated).
       if (type === "sale" && recv > 0) {
@@ -220,6 +247,130 @@ router.post("/sales", requireFeature("sales"), requirePermission("sales", "creat
     throw e;
   }
 });
+
+/**
+ * Apply a sale's effects (SA-04/05, RP-05, AC-01): issue stock from the chosen
+ * location, capture COGS at weighted-avg cost, and post the ledger. Operates on a
+ * sale row + its lines already in the DB. Shared by create and edit.
+ */
+function applyConfirmedSale(tenantId, tier, saleId, allowOverride) {
+  const sale = db.prepare("SELECT * FROM sales WHERE id=?").get(saleId);
+  const sign = sale.doc_type === "return" ? 1 : -1; // sale removes stock, return adds back
+  const lines = db.prepare("SELECT * FROM sale_lines WHERE sale_id=?").all(saleId);
+  let cogs = 0;
+  for (const ln of lines) {
+    const item = db.prepare("SELECT * FROM items WHERE id=? AND tenant_id=?").get(ln.item_id, tenantId);
+    if (!item) throw httpError(400, `Item ${ln.item_id} not found`);
+    if (sale.doc_type === "sale" && !allowOverride) {
+      const available = hasLoc(tier) && sale.location_id ? qtyAt(tenantId, item.id, sale.location_id) : item.stock_qty;
+      if (ln.qty > available) throw httpError(409, `Insufficient stock for ${item.name} (have ${available}, need ${ln.qty})`);
+    }
+    const delta = sign * ln.qty;
+    db.prepare("UPDATE items SET stock_qty = stock_qty + ? WHERE id=?").run(delta, item.id);
+    if (hasLoc(tier) && sale.location_id) adjustNamed(tenantId, item.id, sale.location_id, delta);
+    cogs += ln.qty * item.cost_price * (sale.doc_type === "sale" ? 1 : -1);
+    recordMovement(tenantId, item.id, delta, sale.doc_type === "return" ? "sale_return" : "sale", "sale", saleId);
+  }
+  db.prepare("UPDATE sales SET cogs=? WHERE id=?").run(round(cogs), saleId);
+  if (tierHasFeature(tier, "accounting")) postSale(tenantId, db.prepare("SELECT * FROM sales WHERE id=?").get(saleId));
+}
+
+/**
+ * Edit a sale (admin/can_edit). Reverses the original's stock issue, COGS and
+ * ledger postings, replaces the lines/totals, then re-applies — in one transaction.
+ */
+router.put("/sales/:id", requireFeature("sales"), requirePermission("sales", "edit"), (req, res) => {
+  const s = db.prepare("SELECT * FROM sales WHERE id=? AND tenant_id=?").get(req.params.id, req.tenant.id);
+  if (!s) return res.status(404).json({ error: "Not found" });
+  const { customer_id, doc_date, doc_type, received, notes, lines, allowOverride } = req.body || {};
+  const type = doc_type === "return" ? "return" : "sale";
+  const payAcct = req.body?.payment_account === "bank" ? "bank" : "cash";
+  if (!customer_id) return res.status(400).json({ error: "customer_id is required" });
+  if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: "At least one line is required" });
+
+  const newLocation = resolveLocation(req);
+  try {
+    db.transaction(() => {
+      const oldLines = db.prepare("SELECT * FROM sale_lines WHERE sale_id=?").all(s.id);
+      reverseSaleEffects(req.tenant.id, req.tenant.tier, s, oldLines);
+
+      const totals = computeTotals(lines, req.tenant.tier);
+      const recv = Math.min(num(received), totals.grand);
+      db.prepare(
+        `UPDATE sales SET customer_id=?, doc_type=?, doc_date=?, subtotal=?, tax_total=?, grand_total=?, received=?, cogs=0, notes=?, location_id=?, payment_account=? WHERE id=?`
+      ).run(customer_id, type, doc_date || s.doc_date, totals.subtotal, totals.tax, totals.grand, recv, notes || null, newLocation, payAcct, s.id);
+      db.prepare("DELETE FROM sale_lines WHERE sale_id=?").run(s.id);
+      for (const ln of totals.lines) {
+        db.prepare(`INSERT INTO sale_lines (sale_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)`)
+          .run(s.id, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.line_total);
+      }
+      applyConfirmedSale(req.tenant.id, req.tenant.tier, s.id, allowOverride); // stock + COGS + ledger
+      if (type === "sale" && recv > 0) {
+        db.prepare("INSERT INTO payments (tenant_id, kind, party_id, account, amount, pay_date, note) VALUES (?,?,?,?,?,?,?)")
+          .run(req.tenant.id, "receipt", customer_id, payAcct, recv, doc_date || s.doc_date, `Received against ${s.doc_no}`);
+      }
+    })();
+    logAction(req, "edit", "sale", s.id);
+    res.json(db.prepare("SELECT * FROM sales WHERE id=?").get(s.id));
+  } catch (e) {
+    if (e.httpStatus) return res.status(e.httpStatus).json({ error: e.message });
+    throw e;
+  }
+});
+
+/* ─────────────────────────── edit reversal helpers ─────────────────────────── */
+
+/** Delete the journal entries (and their lines) posted for a document. */
+function deleteJournalByRef(tenantId, refType, refId) {
+  const entries = db.prepare("SELECT id FROM journal_entries WHERE tenant_id=? AND ref_type=? AND ref_id=?").all(tenantId, refType, refId);
+  for (const e of entries) {
+    db.prepare("DELETE FROM journal_lines WHERE entry_id=?").run(e.id);
+    db.prepare("DELETE FROM journal_entries WHERE id=?").run(e.id);
+  }
+}
+
+/** Remove the auto-logged payment row created at bill time (matched by its note). */
+function deleteDocPayments(tenantId, note) {
+  db.prepare("DELETE FROM payments WHERE tenant_id=? AND note=?").run(tenantId, note);
+}
+
+/** Undo a confirmed purchase's stock, weighted-avg cost, location, ledger & payment. */
+function reversePurchaseEffects(tenantId, tier, purchase, lines) {
+  // Reverse in the opposite order to how create applied the running weighted average.
+  for (const ln of [...lines].reverse()) {
+    const item = db.prepare("SELECT * FROM items WHERE id=? AND tenant_id=?").get(ln.item_id, tenantId);
+    if (!item) continue;
+    if (purchase.doc_type === "purchase") {
+      const prevQty = round(item.stock_qty - ln.qty);
+      const prevCost = prevQty > 0 ? round((item.stock_qty * item.cost_price - ln.qty * ln.unit_price) / prevQty) : item.cost_price;
+      db.prepare("UPDATE items SET stock_qty=?, cost_price=? WHERE id=?").run(prevQty, prevCost, item.id);
+      recordMovement(tenantId, item.id, -ln.qty, "edit_reversal", "purchase", purchase.id, `Reversed for edit of ${purchase.doc_no}`);
+      if (hasLoc(tier) && purchase.location_id) adjustNamed(tenantId, item.id, purchase.location_id, -ln.qty);
+    } else { // return originally removed stock (sign -1)
+      db.prepare("UPDATE items SET stock_qty = stock_qty + ? WHERE id=?").run(ln.qty, item.id);
+      recordMovement(tenantId, item.id, ln.qty, "edit_reversal", "purchase", purchase.id, `Reversed for edit of ${purchase.doc_no}`);
+      if (hasLoc(tier) && purchase.location_id) adjustNamed(tenantId, item.id, purchase.location_id, ln.qty);
+    }
+  }
+  deleteJournalByRef(tenantId, "purchase", purchase.id);
+  deleteDocPayments(tenantId, `Paid against ${purchase.doc_no}`);
+}
+
+/** Undo a sale's stock issue, location moves, ledger (sale + COGS) & receipt. */
+function reverseSaleEffects(tenantId, tier, sale, lines) {
+  const origSign = sale.doc_type === "return" ? 1 : -1; // delta create applied
+  for (const ln of lines) {
+    const item = db.prepare("SELECT * FROM items WHERE id=? AND tenant_id=?").get(ln.item_id, tenantId);
+    if (!item) continue;
+    const delta = origSign * ln.qty;
+    db.prepare("UPDATE items SET stock_qty = stock_qty - ? WHERE id=?").run(delta, item.id);
+    if (hasLoc(tier) && sale.location_id) adjustNamed(tenantId, item.id, sale.location_id, -delta);
+    recordMovement(tenantId, item.id, -delta, "edit_reversal", "sale", sale.id, `Reversed for edit of ${sale.doc_no}`);
+  }
+  deleteJournalByRef(tenantId, "sale", sale.id);
+  deleteJournalByRef(tenantId, "sale_cogs", sale.id);
+  deleteDocPayments(tenantId, `Received against ${sale.doc_no}`);
+}
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
