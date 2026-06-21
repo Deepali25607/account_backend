@@ -161,14 +161,27 @@ router.post("/production-orders/:id/draft-po", (req, res) => {
   if (!shortages.length) return res.status(400).json({ error: "No purchase shortages — nothing to order" });
 
   const id = db.transaction(() => {
-    const subtotal = round(shortages.reduce((s, x) => s + x.net * x.cost_price, 0));
+    // Tax per line comes from the item master (GST %), same as manual purchases.
+    const taxRateOf = (itemId) => {
+      const it = db.prepare("SELECT tax_rate FROM items WHERE id=? AND tenant_id=?").get(itemId, req.tenant.id);
+      return it ? Number(it.tax_rate) || 0 : 0;
+    };
+    const rows = shortages.map((s) => {
+      const base = s.net * s.cost_price;
+      const taxRate = taxRateOf(s.item_id);
+      const lineTax = round(base * taxRate / 100);
+      return { item_id: s.item_id, qty: s.net, unit_price: s.cost_price, tax_rate: taxRate, line_total: round(base + lineTax), base, lineTax };
+    });
+    const subtotal = round(rows.reduce((acc, r) => acc + r.base, 0));
+    const taxTotal = round(rows.reduce((acc, r) => acc + r.lineTax, 0));
+    const grand = round(subtotal + taxTotal);
     const docNo = `PO-DRAFT-${Date.now().toString().slice(-6)}`;
     const p = db.prepare(
       `INSERT INTO purchases (tenant_id, vendor_id, doc_no, doc_type, status, subtotal, tax_total, grand_total, notes)
-       VALUES (?,?,?,'purchase','draft',?,0,?,?)`
-    ).run(req.tenant.id, vendor_id, docNo, subtotal, subtotal, `Auto-generated from MRP for production order #${po.id}`);
+       VALUES (?,?,?,'purchase','draft',?,?,?,?)`
+    ).run(req.tenant.id, vendor_id, docNo, subtotal, taxTotal, grand, `Auto-generated from MRP for production order #${po.id}`);
     const ins = db.prepare("INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)");
-    for (const s of shortages) ins.run(p.lastInsertRowid, s.item_id, s.net, s.cost_price, 0, round(s.net * s.cost_price));
+    for (const r of rows) ins.run(p.lastInsertRowid, r.item_id, r.qty, r.unit_price, r.tax_rate, r.line_total);
     return p.lastInsertRowid;
   })();
   logAction(req, "create", "draft_po", id);

@@ -21,16 +21,27 @@ const DEFAULT_COA = {
   "2100": ["GST Payable", "liability"],
   "3000": ["Owner's Equity", "equity"],
   "4000": ["Sales Revenue", "income"],
+  "4100": ["Other Charges Collected", "income"],   // additional charges billed on sales
+  "4200": ["Discount Received", "income"],          // additional discount on purchases
   "5000": ["Cost of Goods Sold", "expense"],
+  "5100": ["Discount Allowed", "expense"],          // additional discount on sales
+  "5200": ["Purchase Expenses", "expense"],         // additional charges paid on purchases
 };
 
-/** Seed the default chart of accounts for a tenant if it has none (AC-02). */
+/**
+ * Seed the default chart of accounts for a tenant (AC-02). Inserts any accounts
+ * from DEFAULT_COA the tenant is missing, so charts seeded before new accounts
+ * were added (e.g. discount/charges) get back-filled on the next post.
+ */
 function ensureChart(tenantId) {
-  const has = db.prepare("SELECT COUNT(*) c FROM accounts WHERE tenant_id=?").get(tenantId).c;
-  if (has) return;
+  const existing = new Set(
+    db.prepare("SELECT code FROM accounts WHERE tenant_id=?").all(tenantId).map((r) => r.code)
+  );
+  const missing = Object.entries(DEFAULT_COA).filter(([code]) => !existing.has(code));
+  if (!missing.length) return;
   const ins = db.prepare("INSERT INTO accounts (tenant_id, code, name, type) VALUES (?,?,?,?)");
   const tx = db.transaction(() => {
-    for (const [code, [name, type]] of Object.entries(DEFAULT_COA)) ins.run(tenantId, code, name, type);
+    for (const [code, [name, type]] of missing) ins.run(tenantId, code, name, type);
   });
   tx();
 }
@@ -62,8 +73,10 @@ function postSale(tenantId, sale) {
     [
       { code: cashCode, debit: s * sale.received },                     // payment received (cash/bank)
       { code: "1100", debit: s * (sale.grand_total - sale.received) },  // receivable balance
+      { code: "5100", debit: s * (sale.discount || 0) },               // discount allowed (contra-revenue)
       { code: "4000", credit: s * sale.subtotal },                      // revenue
       { code: "2100", credit: s * sale.tax_total },                     // output GST
+      { code: "4100", credit: s * (sale.extra_charges || 0) },         // additional charges billed
     ]
   );
   // cost of goods sold ↔ inventory
@@ -86,8 +99,10 @@ function postPurchase(tenantId, purchase) {
     [
       { code: "1200", debit: s * purchase.subtotal },                      // inventory at cost
       { code: "1210", debit: s * purchase.tax_total },                     // input GST credit
+      { code: "5200", debit: s * (purchase.extra_charges || 0) },          // additional charges paid
       { code: cashCode, credit: s * purchase.paid },                       // payment made (cash/bank)
       { code: "2000", credit: s * (purchase.grand_total - purchase.paid) },// payable balance
+      { code: "4200", credit: s * (purchase.discount || 0) },             // additional discount received
     ]
   );
 }

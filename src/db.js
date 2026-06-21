@@ -338,6 +338,21 @@ db.exec(`CREATE TABLE IF NOT EXISTS coupons (
 // Payment received/paid at invoice time → which money account it hit (cash|bank)
 ensureColumn("sales", "payment_account", "payment_account TEXT NOT NULL DEFAULT 'cash'");
 ensureColumn("purchases", "payment_account", "payment_account TEXT NOT NULL DEFAULT 'cash'");
+// Document-level additional charges (e.g. freight/packing) & additional discount.
+// grand_total = subtotal + tax_total − discount + extra_charges.
+// `discount` is the resolved currency amount used in totals/accounting; the
+// discount can be entered as a flat amount or a % of subtotal, so we also keep
+// `discount_type` ('amount'|'percent') and the raw `discount_value` entered.
+ensureColumn("sales", "discount", "discount REAL NOT NULL DEFAULT 0");
+ensureColumn("sales", "discount_type", "discount_type TEXT NOT NULL DEFAULT 'amount'");
+ensureColumn("sales", "discount_value", "discount_value REAL NOT NULL DEFAULT 0");
+ensureColumn("sales", "extra_charges", "extra_charges REAL NOT NULL DEFAULT 0");
+ensureColumn("sales", "extra_charges_note", "extra_charges_note TEXT");
+ensureColumn("purchases", "discount", "discount REAL NOT NULL DEFAULT 0");
+ensureColumn("purchases", "discount_type", "discount_type TEXT NOT NULL DEFAULT 'amount'");
+ensureColumn("purchases", "discount_value", "discount_value REAL NOT NULL DEFAULT 0");
+ensureColumn("purchases", "extra_charges", "extra_charges REAL NOT NULL DEFAULT 0");
+ensureColumn("purchases", "extra_charges_note", "extra_charges_note TEXT");
 // Platform-operator (super-admin) support
 ensureColumn("users", "is_platform_admin", "is_platform_admin INTEGER NOT NULL DEFAULT 0");
 ensureColumn("tenants", "active", "active INTEGER NOT NULL DEFAULT 1");   // org suspend/restore
