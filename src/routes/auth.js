@@ -1,7 +1,7 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const db = require("../db");
-const { signToken, auth } = require("../middleware");
+const { signToken, auth, requireRole, logAction } = require("../middleware");
 const { featuresForTier, USER_LIMITS, tierHasFeature } = require("../entitlements");
 const { ensureChart } = require("../accounting");
 const { ensureRolePermissions } = require("../permissions");
@@ -58,6 +58,46 @@ router.get("/me", auth, (req, res) => {
   res.json(publicMe(req.user, req.tenant));
 });
 
+/**
+ * PUT /api/me/company — update the company profile (owner only).
+ * Lets the account owner maintain the business's legal details (name, address,
+ * GSTIN, contact) that print on invoices/receipts and GST documents.
+ */
+router.put("/me/company", auth, requireRole(), (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name ?? "").trim();
+  if (!name) return res.status(400).json({ error: "Company name is required" });
+  // Whitelist the editable profile fields; trim text, drop everything else.
+  const text = (v) => { const s = String(v ?? "").trim(); return s || null; };
+  // Logo is an inline image data-URL (or "" to remove). Cap size and require an
+  // image/* data-URL so we never persist arbitrary blobs.
+  const logoRaw = String(b.logo ?? "").trim();
+  if (logoRaw && !/^data:image\/[a-z+.-]+;base64,/i.test(logoRaw))
+    return res.status(400).json({ error: "Logo must be an image" });
+  if (logoRaw.length > 1_500_000) return res.status(400).json({ error: "Logo image is too large (max ~1 MB)" });
+  const fields = {
+    name,
+    gstin: text(b.gstin),
+    pan: text(b.pan),
+    phone: text(b.phone),
+    email: text(b.email),
+    website: text(b.website),
+    address: text(b.address),
+    city: text(b.city),
+    state: text(b.state),
+    pincode: text(b.pincode),
+    logo: logoRaw || null,
+  };
+  db.prepare(
+    `UPDATE tenants SET name=@name, gstin=@gstin, pan=@pan, phone=@phone, email=@email,
+       website=@website, address=@address, city=@city, state=@state, pincode=@pincode, logo=@logo
+     WHERE id=@id`
+  ).run({ ...fields, id: req.tenant.id });
+  logAction(req, "update", "company", req.tenant.id);
+  const tenant = db.prepare("SELECT * FROM tenants WHERE id = ?").get(req.tenant.id);
+  res.json(publicMe(req.user, tenant));
+});
+
 /** GET /api/auth/pricing — current plan price list (read-only for tenants). */
 router.get("/pricing", auth, (req, res) => {
   res.json(require("../pricing").getPricing());
@@ -87,7 +127,12 @@ router.patch("/me/tier", auth, (req, res) => {
 function publicMe(user, tenant) {
   return {
     user: { id: user.id, name: user.name, email: user.email, role: user.role },
-    tenant: { id: tenant.id, name: tenant.name, tier: tenant.tier, currency: tenant.base_currency },
+    tenant: {
+      id: tenant.id, name: tenant.name, tier: tenant.tier, currency: tenant.base_currency,
+      gstin: tenant.gstin || "", pan: tenant.pan || "", phone: tenant.phone || "", email: tenant.email || "",
+      website: tenant.website || "", address: tenant.address || "", city: tenant.city || "",
+      state: tenant.state || "", pincode: tenant.pincode || "", logo: tenant.logo || "",
+    },
     features: featuresForTier(tenant.tier),
     userLimit: USER_LIMITS[tenant.tier],
     platformAdmin: !!user.is_platform_admin,

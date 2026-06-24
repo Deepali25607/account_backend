@@ -64,8 +64,8 @@ router.post("/purchases", requireFeature("purchases"), requirePermission("purcha
         totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.grand, paidAmt, notes || null, locationId, payAcct);
     for (const ln of totals.lines) {
       db.prepare(
-        `INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)`
-      ).run(p.lastInsertRowid, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.line_total);
+        `INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, discount, discount_type, discount_value, line_total) VALUES (?,?,?,?,?,?,?,?,?)`
+      ).run(p.lastInsertRowid, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.discount, ln.discount_type, ln.discount_value, ln.line_total);
     }
     applyConfirmedPurchase(req.tenant.id, req.tenant.tier, p.lastInsertRowid); // stock + accounting
     // Log the payment made at bill time so it appears in Payments history.
@@ -157,8 +157,8 @@ router.put("/purchases/:id", requireFeature("purchases"), requirePermission("pur
       ).run(vendor_id, type, doc_date || p.doc_date, totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.grand, paidAmt, notes || null, newLocation, payAcct, p.id);
       db.prepare("DELETE FROM purchase_lines WHERE purchase_id=?").run(p.id);
       for (const ln of totals.lines) {
-        db.prepare(`INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)`)
-          .run(p.id, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.line_total);
+        db.prepare(`INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, discount, discount_type, discount_value, line_total) VALUES (?,?,?,?,?,?,?,?,?)`)
+          .run(p.id, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.discount, ln.discount_type, ln.discount_value, ln.line_total);
       }
       if (p.status === "confirmed") {
         applyConfirmedPurchase(req.tenant.id, req.tenant.tier, p.id); // stock + cost + ledger
@@ -227,8 +227,8 @@ router.post("/sales", requireFeature("sales"), requirePermission("sales", "creat
 
       for (const ln of totals.lines) {
         db.prepare(
-          `INSERT INTO sale_lines (sale_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)`
-        ).run(s.lastInsertRowid, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.line_total);
+          `INSERT INTO sale_lines (sale_id, item_id, qty, unit_price, tax_rate, discount, discount_type, discount_value, line_total) VALUES (?,?,?,?,?,?,?,?,?)`
+        ).run(s.lastInsertRowid, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.discount, ln.discount_type, ln.discount_value, ln.line_total);
       }
       applyConfirmedSale(req.tenant.id, req.tenant.tier, s.lastInsertRowid, allowOverride); // stock + COGS + ledger
       // Log the payment received at invoice time so it appears in Payments history
@@ -301,8 +301,8 @@ router.put("/sales/:id", requireFeature("sales"), requirePermission("sales", "ed
       ).run(customer_id, type, doc_date || s.doc_date, totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.grand, recv, notes || null, newLocation, payAcct, s.id);
       db.prepare("DELETE FROM sale_lines WHERE sale_id=?").run(s.id);
       for (const ln of totals.lines) {
-        db.prepare(`INSERT INTO sale_lines (sale_id, item_id, qty, unit_price, tax_rate, line_total) VALUES (?,?,?,?,?,?)`)
-          .run(s.id, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.line_total);
+        db.prepare(`INSERT INTO sale_lines (sale_id, item_id, qty, unit_price, tax_rate, discount, discount_type, discount_value, line_total) VALUES (?,?,?,?,?,?,?,?,?)`)
+          .run(s.id, ln.item_id, ln.qty, ln.unit_price, ln.tax_rate, ln.discount, ln.discount_type, ln.discount_value, ln.line_total);
       }
       applyConfirmedSale(req.tenant.id, req.tenant.tier, s.id, allowOverride); // stock + COGS + ledger
       if (type === "sale" && recv > 0) {
@@ -379,6 +379,11 @@ function reverseSaleEffects(tenantId, tier, sale, lines) {
  * (items.tax_rate) when an item is picked on the form, but the user can edit it
  * per line — so we honour the rate submitted on each line. Basic tier is untaxed.
  *
+ * Item-wise discount (per line, before tax): each line may carry its own discount
+ * as a flat amount (discount_type 'amount') or a % of the line's base
+ * (discount_type 'percent'), clamped to the line base. The discounted base is what
+ * gets taxed, and `subtotal` is the sum of those net bases.
+ *
  * Document-level extras (after tax): an additional discount is subtracted and
  * flat additional `charges` (freight/packing) are added, giving
  * grand = subtotal + tax − discount + charges. The discount can be entered as a
@@ -393,9 +398,19 @@ function computeTotals(lines, tier, extras = {}) {
     const qty = num(ln.qty), price = num(ln.unit_price);
     const rate = taxable ? num(ln.tax_rate) : 0;
     const base = qty * price;
-    const lineTax = round(base * rate / 100);
-    subtotal += base; tax += lineTax;
-    return { item_id: ln.item_id, qty, unit_price: price, tax_rate: rate, line_total: round(base + lineTax) };
+    // Resolve the line discount, then clamp it so a line never goes negative.
+    const lnDiscType = ln.discount_type === "percent" ? "percent" : "amount";
+    const lnDiscValue = Math.max(0, num(ln.discount_value));
+    const rawLnDisc = lnDiscType === "percent" ? base * Math.min(lnDiscValue, 100) / 100 : lnDiscValue;
+    const lnDisc = Math.min(rawLnDisc, base);
+    const net = base - lnDisc;
+    const lineTax = round(net * rate / 100);
+    subtotal += net; tax += lineTax;
+    return {
+      item_id: ln.item_id, qty, unit_price: price, tax_rate: rate,
+      discount: round(lnDisc), discount_type: lnDiscType, discount_value: round(lnDiscValue),
+      line_total: round(net + lineTax),
+    };
   });
   const charges = Math.max(0, num(extras.charges));
   const discountType = extras.discountType === "percent" ? "percent" : "amount";

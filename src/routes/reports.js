@@ -1,6 +1,7 @@
 const express = require("express");
 const db = require("../db");
 const { auth, requireFeature } = require("../middleware");
+const { tierHasFeature } = require("../entitlements");
 
 const router = express.Router();
 router.use(auth);
@@ -112,6 +113,70 @@ router.get("/dashboard", (req, res) => {
      GROUP BY month ORDER BY month`
   ).all(t);
   res.json({ sales30, purch30, stockValue: Math.round(stockValue * 100) / 100, lowStock, counts, trend });
+});
+
+/**
+ * Business Assistant — plain-language insights for the dashboard card.
+ * Each block is null when it has nothing useful to say, so the UI only renders
+ * the lines that matter. Money is returned raw; the client formats currency.
+ */
+router.get("/assistant", (req, res) => {
+  const t = req.tenant.id;
+  const round = (n) => Math.round((n || 0) * 100) / 100;
+
+  // Receivables — total outstanding & how many customers owe it (mirrors RP-06).
+  const recv = db.prepare(
+    `SELECT COUNT(*) AS customers, COALESCE(SUM(outstanding),0) AS total FROM (
+       SELECT SUM(s.grand_total - s.received) AS outstanding
+       FROM sales s WHERE s.tenant_id=? AND s.doc_type='sale'
+       GROUP BY s.customer_id HAVING outstanding > 0
+     )`
+  ).get(t);
+  const receivables = recv.total > 0 ? { total: round(recv.total), customers: recv.customers } : null;
+
+  // Best-selling product this calendar month, ranked by quantity sold.
+  const top = db.prepare(
+    `SELECT i.name, COALESCE(SUM(sl.qty),0) AS qty, COALESCE(SUM(sl.line_total),0) AS revenue
+     FROM sale_lines sl
+     JOIN sales s ON s.id=sl.sale_id
+     JOIN items i ON i.id=sl.item_id
+     WHERE s.tenant_id=? AND s.doc_type='sale' AND s.status='confirmed'
+       AND s.doc_date >= date('now','start of month')
+     GROUP BY sl.item_id ORDER BY qty DESC, revenue DESC LIMIT 1`
+  ).get(t);
+  const topProduct = top && top.qty > 0 ? { name: top.name, qty: round(top.qty), revenue: round(top.revenue) } : null;
+
+  // Gross profit this month (month-to-date) vs all of last month (mirrors RP-05).
+  const profitFor = (from, to) => {
+    const r = db.prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN doc_type='sale' THEN subtotal ELSE -subtotal END),0) AS sales_value,
+         COALESCE(SUM(cogs),0) AS cost_value
+       FROM sales WHERE tenant_id=? AND status='confirmed' AND doc_date BETWEEN ? AND ?`
+    ).get(t, from, to);
+    return r.sales_value - r.cost_value;
+  };
+  const dt = (expr) => db.prepare(`SELECT date(${expr}) d`).get().d;
+  const thisProfit = profitFor(dt("'now','start of month'"), dt("'now'"));
+  const lastProfit = profitFor(dt("'now','start of month','-1 month'"), dt("'now','start of month','-1 day'"));
+  let profit = null;
+  if (thisProfit !== 0 || lastProfit !== 0) {
+    const changePct = lastProfit !== 0 ? Math.round(((thisProfit - lastProfit) / Math.abs(lastProfit)) * 1000) / 10 : null;
+    profit = { thisMonth: round(thisProfit), lastMonth: round(lastProfit), changePct, direction: thisProfit >= lastProfit ? "up" : "down" };
+  }
+
+  // GST filing countdown — GSTR-3B is due the 20th of the following month. We
+  // surface the next upcoming 20th. Only relevant for GST-enabled plans.
+  let gst = null;
+  if (tierHasFeature(req.tenant.tier, "gst")) {
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    let due = new Date(today.getFullYear(), today.getMonth(), 20);
+    if (today > due) due = new Date(due.getFullYear(), due.getMonth() + 1, 20);
+    const daysLeft = Math.round((due - today) / 86400000);
+    gst = { ret: "GSTR-3B", dueDate: due.toISOString().slice(0, 10), daysLeft };
+  }
+
+  res.json({ receivables, topProduct, profit, gst });
 });
 
 module.exports = router;

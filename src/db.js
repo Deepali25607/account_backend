@@ -353,9 +353,29 @@ ensureColumn("purchases", "discount_type", "discount_type TEXT NOT NULL DEFAULT 
 ensureColumn("purchases", "discount_value", "discount_value REAL NOT NULL DEFAULT 0");
 ensureColumn("purchases", "extra_charges", "extra_charges REAL NOT NULL DEFAULT 0");
 ensureColumn("purchases", "extra_charges_note", "extra_charges_note TEXT");
+// Item-wise (line-level) discount, applied to a line's base before tax. `discount`
+// is the resolved currency amount used in totals; `discount_type`/`discount_value`
+// keep what was entered (flat amount or % of the line) so edits round-trip.
+ensureColumn("purchase_lines", "discount", "discount REAL NOT NULL DEFAULT 0");
+ensureColumn("purchase_lines", "discount_type", "discount_type TEXT NOT NULL DEFAULT 'amount'");
+ensureColumn("purchase_lines", "discount_value", "discount_value REAL NOT NULL DEFAULT 0");
+ensureColumn("sale_lines", "discount", "discount REAL NOT NULL DEFAULT 0");
+ensureColumn("sale_lines", "discount_type", "discount_type TEXT NOT NULL DEFAULT 'amount'");
+ensureColumn("sale_lines", "discount_value", "discount_value REAL NOT NULL DEFAULT 0");
 // Platform-operator (super-admin) support
 ensureColumn("users", "is_platform_admin", "is_platform_admin INTEGER NOT NULL DEFAULT 0");
 ensureColumn("tenants", "active", "active INTEGER NOT NULL DEFAULT 1");   // org suspend/restore
 ensureColumn("tenants", "is_platform", "is_platform INTEGER NOT NULL DEFAULT 0"); // hidden platform tenant
+// Company profile (owner-editable) — appears on invoices/receipts & GST documents.
+ensureColumn("tenants", "gstin", "gstin TEXT");          // GST identification number
+ensureColumn("tenants", "pan", "pan TEXT");              // PAN
+ensureColumn("tenants", "phone", "phone TEXT");
+ensureColumn("tenants", "email", "email TEXT");
+ensureColumn("tenants", "website", "website TEXT");
+ensureColumn("tenants", "address", "address TEXT");      // street / building (multi-line)
+ensureColumn("tenants", "city", "city TEXT");
+ensureColumn("tenants", "state", "state TEXT");
+ensureColumn("tenants", "pincode", "pincode TEXT");
+ensureColumn("tenants", "logo", "logo TEXT");           // company logo as a data-URL (shown on invoices)
 
 module.exports = db;
