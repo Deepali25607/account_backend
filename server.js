@@ -10,6 +10,9 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
+// Company backup imports can be large (full dataset + logo data-URL); give that
+// one path a roomier body limit before the global parser claims the request.
+app.use("/api/backup", express.json({ limit: "50mb" }));
 app.use(express.json({ limit: "6mb" })); // headroom for QR image data-URLs
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
@@ -39,6 +42,7 @@ app.use("/api/locations", require("./src/routes/locations"));
 app.use("/api/payments", require("./src/routes/payments"));
 app.use("/api/plan-requests", require("./src/routes/plan-requests"));
 app.use("/api/platform", require("./src/routes/platform"));
+app.use("/api/backup", require("./src/routes/backup"));
 
 // JSON error fallback so the SPA always gets a structured error
 app.use((err, req, res, next) => {
