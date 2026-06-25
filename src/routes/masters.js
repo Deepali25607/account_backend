@@ -212,11 +212,11 @@ function masterRoutes(table, feature) {
     res.json(db.prepare(`SELECT * FROM ${table} WHERE tenant_id=? ORDER BY name`).all(req.tenant.id));
   });
   router.post(`/${table}`, requireFeature(feature), (req, res) => {
-    const { name, email, phone, tax_no, payment_terms } = req.body || {};
+    const { name, email, phone, tax_no, payment_terms, address, city, state, pincode, contact_person } = req.body || {};
     if (!name) return res.status(400).json({ error: "name is required" });
     const r = db
-      .prepare(`INSERT INTO ${table} (tenant_id, name, email, phone, tax_no, payment_terms) VALUES (?,?,?,?,?,?)`)
-      .run(req.tenant.id, name, email || null, phone || null, tax_no || null, payment_terms || null);
+      .prepare(`INSERT INTO ${table} (tenant_id, name, email, phone, tax_no, payment_terms, address, city, state, pincode, contact_person) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(req.tenant.id, name, email || null, phone || null, tax_no || null, payment_terms || null, address || null, city || null, state || null, pincode || null, contact_person || null);
     logAction(req, "create", table, r.lastInsertRowid);
     res.status(201).json(db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(r.lastInsertRowid));
   });
@@ -225,10 +225,14 @@ function masterRoutes(table, feature) {
   router.put(`/${table}/:id`, requireFeature(feature), (req, res) => {
     const row = db.prepare(`SELECT * FROM ${table} WHERE id=? AND tenant_id=?`).get(req.params.id, req.tenant.id);
     if (!row) return res.status(404).json({ error: "Not found" });
-    const { name, email, phone, tax_no, payment_terms } = req.body || {};
+    const { name, email, phone, tax_no, payment_terms, address, city, state, pincode, contact_person } = req.body || {};
     if (name !== undefined && !String(name).trim()) return res.status(400).json({ error: "name cannot be empty" });
-    db.prepare(`UPDATE ${table} SET name=?, email=?, phone=?, tax_no=?, payment_terms=? WHERE id=? AND tenant_id=?`)
-      .run(name ?? row.name, email ?? row.email, phone ?? row.phone, tax_no ?? row.tax_no, payment_terms ?? row.payment_terms, row.id, req.tenant.id);
+    db.prepare(`UPDATE ${table} SET name=?, email=?, phone=?, tax_no=?, payment_terms=?, address=?, city=?, state=?, pincode=?, contact_person=? WHERE id=? AND tenant_id=?`)
+      .run(
+        name ?? row.name, email ?? row.email, phone ?? row.phone, tax_no ?? row.tax_no, payment_terms ?? row.payment_terms,
+        address ?? row.address, city ?? row.city, state ?? row.state, pincode ?? row.pincode, contact_person ?? row.contact_person,
+        row.id, req.tenant.id,
+      );
     logAction(req, "update", table, row.id);
     res.json(db.prepare(`SELECT * FROM ${table} WHERE id=?`).get(row.id));
   });

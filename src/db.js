@@ -89,6 +89,11 @@ function init() {
       phone       TEXT,
       tax_no      TEXT,                          -- GSTIN (PU-02)
       payment_terms TEXT,
+      address        TEXT,
+      city           TEXT,
+      state          TEXT,
+      pincode        TEXT,
+      contact_person TEXT,
       created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -100,6 +105,11 @@ function init() {
       phone       TEXT,
       tax_no      TEXT,
       payment_terms TEXT,
+      address        TEXT,
+      city           TEXT,
+      state          TEXT,
+      pincode        TEXT,
+      contact_person TEXT,
       created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -282,6 +292,14 @@ ensureColumn("sales", "location_id", "location_id INTEGER");
 ensureColumn("items", "material_type", "material_type TEXT NOT NULL DEFAULT 'trading'");
 ensureColumn("items", "barcode", "barcode TEXT");   // IN-01: scannable barcode / EAN
 ensureColumn("items", "hsn", "hsn TEXT");           // GST HSN/SAC code (master-defined)
+// Party (supplier/customer) address & contact details — added for fuller master records.
+for (const t of ["vendors", "customers"]) {
+  ensureColumn(t, "address", "address TEXT");
+  ensureColumn(t, "city", "city TEXT");
+  ensureColumn(t, "state", "state TEXT");
+  ensureColumn(t, "pincode", "pincode TEXT");
+  ensureColumn(t, "contact_person", "contact_person TEXT");
+}
 // Unique per tenant, but only when a barcode is set (multiple NULLs allowed).
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_items_barcode ON items(tenant_id, barcode) WHERE barcode IS NOT NULL");
 // Platform-wide subscription pricing, managed by the super admin.
