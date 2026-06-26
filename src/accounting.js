@@ -23,6 +23,7 @@ const DEFAULT_COA = {
   "4000": ["Sales Revenue", "income"],
   "4100": ["Other Charges Collected", "income"],   // additional charges billed on sales
   "4200": ["Discount Received", "income"],          // additional discount on purchases
+  "4300": ["Round Off", "income"],                  // total round-off (gain credited / loss debited; nets either way)
   "5000": ["Cost of Goods Sold", "expense"],
   "5100": ["Discount Allowed", "expense"],          // additional discount on sales
   "5200": ["Purchase Expenses", "expense"],         // additional charges paid on purchases
@@ -77,6 +78,7 @@ function postSale(tenantId, sale) {
       { code: "4000", credit: s * sale.subtotal },                      // revenue
       { code: "2100", credit: s * sale.tax_total },                     // output GST
       { code: "4100", credit: s * (sale.extra_charges || 0) },         // additional charges billed
+      { code: "4300", credit: s * (sale.round_off || 0) },             // total round-off (keeps the entry balanced)
     ]
   );
   // cost of goods sold ↔ inventory
@@ -100,6 +102,7 @@ function postPurchase(tenantId, purchase) {
       { code: "1200", debit: s * purchase.subtotal },                      // inventory at cost
       { code: "1210", debit: s * purchase.tax_total },                     // input GST credit
       { code: "5200", debit: s * (purchase.extra_charges || 0) },          // additional charges paid
+      { code: "4300", debit: s * (purchase.round_off || 0) },              // total round-off (keeps the entry balanced)
       { code: cashCode, credit: s * purchase.paid },                       // payment made (cash/bank)
       { code: "2000", credit: s * (purchase.grand_total - purchase.paid) },// payable balance
       { code: "4200", credit: s * (purchase.discount || 0) },             // additional discount received

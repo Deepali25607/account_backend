@@ -5,7 +5,7 @@
 const express = require("express");
 const db = require("../db");
 const { auth, logAction } = require("../middleware");
-const { listPayments, partiesWithBalance, recordPayment } = require("../payment-service");
+const { listPayments, partiesWithBalance, openBills, recordPayment } = require("../payment-service");
 
 const router = express.Router();
 router.use(auth);
@@ -19,6 +19,12 @@ router.get("/", (req, res) => {
 router.get("/parties", (req, res) => {
   const kind = req.query.kind === "payment" ? "payment" : "receipt";
   res.json(partiesWithBalance(req.tenant.id, kind));
+});
+
+/** GET /payments/bills?kind=receipt|payment&party_id=… — a party's open bills. */
+router.get("/bills", (req, res) => {
+  const kind = req.query.kind === "payment" ? "payment" : "receipt";
+  res.json(openBills(req.tenant.id, kind, Number(req.query.party_id)));
 });
 
 /** POST /payments — record a Payment In (receipt) or Payment Out (payment). */

@@ -101,6 +101,15 @@ router.get("/dashboard", (req, res) => {
   ).v;
   const stockValue = g(`SELECT COALESCE(SUM(stock_qty*cost_price),0) v FROM items WHERE tenant_id=?`).v;
   const lowStock = g(`SELECT COUNT(*) c FROM items WHERE tenant_id=? AND stock_qty <= reorder_lvl`).c;
+  // Supplier outstanding (payables) — sum each vendor's unpaid balance, counting
+  // only those who are net owed (mirrors the /outstanding payables report).
+  const payables = g(
+    `SELECT COALESCE(SUM(outstanding),0) v FROM (
+       SELECT SUM(p.grand_total - p.paid) AS outstanding
+       FROM purchases p WHERE p.tenant_id=? AND p.doc_type='purchase'
+       GROUP BY p.vendor_id HAVING outstanding > 0
+     )`
+  ).v;
   const counts = {
     items: g(`SELECT COUNT(*) c FROM items WHERE tenant_id=?`).c,
     customers: g(`SELECT COUNT(*) c FROM customers WHERE tenant_id=?`).c,
@@ -112,7 +121,7 @@ router.get("/dashboard", (req, res) => {
      FROM sales WHERE tenant_id=? AND doc_type='sale' AND doc_date >= date('now','-6 month')
      GROUP BY month ORDER BY month`
   ).all(t);
-  res.json({ sales30, purch30, stockValue: Math.round(stockValue * 100) / 100, lowStock, counts, trend });
+  res.json({ sales30, purch30, stockValue: Math.round(stockValue * 100) / 100, payables: Math.round(payables * 100) / 100, lowStock, counts, trend });
 });
 
 /**

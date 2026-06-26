@@ -371,6 +371,13 @@ ensureColumn("purchases", "discount_type", "discount_type TEXT NOT NULL DEFAULT 
 ensureColumn("purchases", "discount_value", "discount_value REAL NOT NULL DEFAULT 0");
 ensureColumn("purchases", "extra_charges", "extra_charges REAL NOT NULL DEFAULT 0");
 ensureColumn("purchases", "extra_charges_note", "extra_charges_note TEXT");
+// Optional total round-off: signed adjustment folded into grand_total so the
+// payable figure is a whole number (grand_total already reflects it).
+ensureColumn("sales", "round_off", "round_off REAL NOT NULL DEFAULT 0");
+ensureColumn("purchases", "round_off", "round_off REAL NOT NULL DEFAULT 0");
+// Sale invoices can be entered GST-inclusive (price embeds tax) or exclusive
+// (tax added on top). Stored so edit/print reproduce the same figures.
+ensureColumn("sales", "tax_inclusive", "tax_inclusive INTEGER NOT NULL DEFAULT 0");
 // Item-wise (line-level) discount, applied to a line's base before tax. `discount`
 // is the resolved currency amount used in totals; `discount_type`/`discount_value`
 // keep what was entered (flat amount or % of the line) so edits round-trip.

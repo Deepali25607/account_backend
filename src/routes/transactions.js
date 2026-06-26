@@ -44,7 +44,7 @@ router.get("/purchases/:id", requireFeature("purchases"), (req, res) => {
  * doc_type, paid, notes, lines:[{item_id, qty, unit_price, tax_rate}] }
  */
 router.post("/purchases", requireFeature("purchases"), requirePermission("purchases", "create"), (req, res) => {
-  const { vendor_id, doc_date, doc_type, paid, notes, lines, discount_type, discount_value, extra_charges, extra_charges_note } = req.body || {};
+  const { vendor_id, doc_date, doc_type, paid, notes, lines, discount_type, discount_value, extra_charges, extra_charges_note, round_off } = req.body || {};
   const type = doc_type === "return" ? "return" : "purchase";
   const payAcct = req.body?.payment_account === "bank" ? "bank" : "cash";
   if (!vendor_id) return res.status(400).json({ error: "vendor_id is required" });
@@ -52,16 +52,16 @@ router.post("/purchases", requireFeature("purchases"), requirePermission("purcha
 
   const locationId = resolveLocation(req);
   const result = db.transaction(() => {
-    const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges });
+    const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges, roundOff: round_off });
     const docNo = nextDocNo("purchases", type === "return" ? "PR" : "PO", req.tenant.id);
     const paidAmt = Math.min(num(paid), totals.grand); // never record more paid than the bill total
     const p = db
       .prepare(
-        `INSERT INTO purchases (tenant_id, vendor_id, doc_no, doc_type, doc_date, status, subtotal, tax_total, discount, discount_type, discount_value, extra_charges, extra_charges_note, grand_total, paid, notes, location_id, payment_account)
-         VALUES (?,?,?,?,?,'confirmed',?,?,?,?,?,?,?,?,?,?,?,?)`
+        `INSERT INTO purchases (tenant_id, vendor_id, doc_no, doc_type, doc_date, status, subtotal, tax_total, discount, discount_type, discount_value, extra_charges, extra_charges_note, round_off, grand_total, paid, notes, location_id, payment_account)
+         VALUES (?,?,?,?,?,'confirmed',?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(req.tenant.id, vendor_id, docNo, type, doc_date || today(),
-        totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.grand, paidAmt, notes || null, locationId, payAcct);
+        totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.round_off, totals.grand, paidAmt, notes || null, locationId, payAcct);
     for (const ln of totals.lines) {
       db.prepare(
         `INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, discount, discount_type, discount_value, line_total) VALUES (?,?,?,?,?,?,?,?,?)`
@@ -138,7 +138,7 @@ function applyConfirmedPurchase(tenantId, tier, purchaseId) {
 router.put("/purchases/:id", requireFeature("purchases"), requirePermission("purchases", "edit"), (req, res) => {
   const p = db.prepare("SELECT * FROM purchases WHERE id=? AND tenant_id=?").get(req.params.id, req.tenant.id);
   if (!p) return res.status(404).json({ error: "Not found" });
-  const { vendor_id, doc_date, doc_type, paid, notes, lines, discount_type, discount_value, extra_charges, extra_charges_note } = req.body || {};
+  const { vendor_id, doc_date, doc_type, paid, notes, lines, discount_type, discount_value, extra_charges, extra_charges_note, round_off } = req.body || {};
   const type = doc_type === "return" ? "return" : "purchase";
   const payAcct = req.body?.payment_account === "bank" ? "bank" : "cash";
   if (!vendor_id) return res.status(400).json({ error: "vendor_id is required" });
@@ -150,11 +150,11 @@ router.put("/purchases/:id", requireFeature("purchases"), requirePermission("pur
       const oldLines = db.prepare("SELECT * FROM purchase_lines WHERE purchase_id=?").all(p.id);
       if (p.status === "confirmed") reversePurchaseEffects(req.tenant.id, req.tenant.tier, p, oldLines);
 
-      const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges });
+      const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges, roundOff: round_off });
       const paidAmt = Math.min(num(paid), totals.grand);
       db.prepare(
-        `UPDATE purchases SET vendor_id=?, doc_type=?, doc_date=?, subtotal=?, tax_total=?, discount=?, discount_type=?, discount_value=?, extra_charges=?, extra_charges_note=?, grand_total=?, paid=?, notes=?, location_id=?, payment_account=? WHERE id=?`
-      ).run(vendor_id, type, doc_date || p.doc_date, totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.grand, paidAmt, notes || null, newLocation, payAcct, p.id);
+        `UPDATE purchases SET vendor_id=?, doc_type=?, doc_date=?, subtotal=?, tax_total=?, discount=?, discount_type=?, discount_value=?, extra_charges=?, extra_charges_note=?, round_off=?, grand_total=?, paid=?, notes=?, location_id=?, payment_account=? WHERE id=?`
+      ).run(vendor_id, type, doc_date || p.doc_date, totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.round_off, totals.grand, paidAmt, notes || null, newLocation, payAcct, p.id);
       db.prepare("DELETE FROM purchase_lines WHERE purchase_id=?").run(p.id);
       for (const ln of totals.lines) {
         db.prepare(`INSERT INTO purchase_lines (purchase_id, item_id, qty, unit_price, tax_rate, discount, discount_type, discount_value, line_total) VALUES (?,?,?,?,?,?,?,?,?)`)
@@ -205,25 +205,26 @@ router.get("/sales/:id", requireFeature("sales"), (req, res) => {
  * reporting (RP-05). Returns add stock back and reduce receivable (SA-03).
  */
 router.post("/sales", requireFeature("sales"), requirePermission("sales", "create"), (req, res) => {
-  const { customer_id, doc_date, doc_type, received, notes, lines, allowOverride, discount_type, discount_value, extra_charges, extra_charges_note } = req.body || {};
+  const { customer_id, doc_date, doc_type, received, notes, lines, allowOverride, discount_type, discount_value, extra_charges, extra_charges_note, round_off, tax_inclusive } = req.body || {};
   const type = doc_type === "return" ? "return" : "sale";
   const payAcct = req.body?.payment_account === "bank" ? "bank" : "cash";
+  const taxIncl = tax_inclusive ? 1 : 0;
   if (!customer_id) return res.status(400).json({ error: "customer_id is required" });
   if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: "At least one line is required" });
 
   const locationId = resolveLocation(req);
   try {
     const result = db.transaction(() => {
-      const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges });
+      const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges, roundOff: round_off, taxInclusive: taxIncl });
       const docNo = nextDocNo("sales", type === "return" ? "CN" : "INV", req.tenant.id);
       const recv = Math.min(num(received), totals.grand); // never record more received than the invoice total
       const s = db
         .prepare(
-          `INSERT INTO sales (tenant_id, customer_id, doc_no, doc_type, doc_date, subtotal, tax_total, discount, discount_type, discount_value, extra_charges, extra_charges_note, grand_total, received, cogs, notes, location_id, payment_account)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+          `INSERT INTO sales (tenant_id, customer_id, doc_no, doc_type, doc_date, subtotal, tax_total, discount, discount_type, discount_value, extra_charges, extra_charges_note, round_off, tax_inclusive, grand_total, received, cogs, notes, location_id, payment_account)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
         )
         .run(req.tenant.id, customer_id, docNo, type, doc_date || today(),
-          totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.grand, recv, 0, notes || null, locationId, payAcct);
+          totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.round_off, taxIncl, totals.grand, recv, 0, notes || null, locationId, payAcct);
 
       for (const ln of totals.lines) {
         db.prepare(
@@ -282,9 +283,10 @@ function applyConfirmedSale(tenantId, tier, saleId, allowOverride) {
 router.put("/sales/:id", requireFeature("sales"), requirePermission("sales", "edit"), (req, res) => {
   const s = db.prepare("SELECT * FROM sales WHERE id=? AND tenant_id=?").get(req.params.id, req.tenant.id);
   if (!s) return res.status(404).json({ error: "Not found" });
-  const { customer_id, doc_date, doc_type, received, notes, lines, allowOverride, discount_type, discount_value, extra_charges, extra_charges_note } = req.body || {};
+  const { customer_id, doc_date, doc_type, received, notes, lines, allowOverride, discount_type, discount_value, extra_charges, extra_charges_note, round_off, tax_inclusive } = req.body || {};
   const type = doc_type === "return" ? "return" : "sale";
   const payAcct = req.body?.payment_account === "bank" ? "bank" : "cash";
+  const taxIncl = tax_inclusive ? 1 : 0;
   if (!customer_id) return res.status(400).json({ error: "customer_id is required" });
   if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: "At least one line is required" });
 
@@ -294,11 +296,11 @@ router.put("/sales/:id", requireFeature("sales"), requirePermission("sales", "ed
       const oldLines = db.prepare("SELECT * FROM sale_lines WHERE sale_id=?").all(s.id);
       reverseSaleEffects(req.tenant.id, req.tenant.tier, s, oldLines);
 
-      const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges });
+      const totals = computeTotals(lines, req.tenant.tier, { discountType: discount_type, discountValue: discount_value, charges: extra_charges, roundOff: round_off, taxInclusive: taxIncl });
       const recv = Math.min(num(received), totals.grand);
       db.prepare(
-        `UPDATE sales SET customer_id=?, doc_type=?, doc_date=?, subtotal=?, tax_total=?, discount=?, discount_type=?, discount_value=?, extra_charges=?, extra_charges_note=?, grand_total=?, received=?, cogs=0, notes=?, location_id=?, payment_account=? WHERE id=?`
-      ).run(customer_id, type, doc_date || s.doc_date, totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.grand, recv, notes || null, newLocation, payAcct, s.id);
+        `UPDATE sales SET customer_id=?, doc_type=?, doc_date=?, subtotal=?, tax_total=?, discount=?, discount_type=?, discount_value=?, extra_charges=?, extra_charges_note=?, round_off=?, tax_inclusive=?, grand_total=?, received=?, cogs=0, notes=?, location_id=?, payment_account=? WHERE id=?`
+      ).run(customer_id, type, doc_date || s.doc_date, totals.subtotal, totals.tax, totals.discount, totals.discount_type, totals.discount_value, totals.charges, chargesNote(extra_charges_note, totals.charges), totals.round_off, taxIncl, totals.grand, recv, notes || null, newLocation, payAcct, s.id);
       db.prepare("DELETE FROM sale_lines WHERE sale_id=?").run(s.id);
       for (const ln of totals.lines) {
         db.prepare(`INSERT INTO sale_lines (sale_id, item_id, qty, unit_price, tax_rate, discount, discount_type, discount_value, line_total) VALUES (?,?,?,?,?,?,?,?,?)`)
@@ -393,6 +395,9 @@ function reverseSaleEffects(tenantId, tier, sale, lines) {
  */
 function computeTotals(lines, tier, extras = {}) {
   const taxable = tier !== "basic"; // GST only Standard+ (§5.2)
+  // Tax-inclusive: the entered unit price already contains GST, so we back the
+  // tax out of it. Tax-exclusive (default): GST is added on top of the price.
+  const taxInclusive = !!extras.taxInclusive;
   let subtotal = 0, tax = 0;
   const out = lines.map((ln) => {
     const qty = num(ln.qty), price = num(ln.unit_price);
@@ -403,13 +408,20 @@ function computeTotals(lines, tier, extras = {}) {
     const lnDiscValue = Math.max(0, num(ln.discount_value));
     const rawLnDisc = lnDiscType === "percent" ? base * Math.min(lnDiscValue, 100) / 100 : lnDiscValue;
     const lnDisc = Math.min(rawLnDisc, base);
-    const net = base - lnDisc;
-    const lineTax = round(net * rate / 100);
-    subtotal += net; tax += lineTax;
+    const net = base - lnDisc; // tax-inclusive: gross (tax-in); tax-exclusive: taxable value
+    let taxableNet, lineTax;
+    if (taxInclusive && rate > 0) {
+      lineTax = round(net - net / (1 + rate / 100));
+      taxableNet = round(net - lineTax); // keeps taxableNet + lineTax === net
+    } else {
+      lineTax = round(net * rate / 100);
+      taxableNet = net;
+    }
+    subtotal += taxableNet; tax += lineTax;
     return {
       item_id: ln.item_id, qty, unit_price: price, tax_rate: rate,
       discount: round(lnDisc), discount_type: lnDiscType, discount_value: round(lnDiscValue),
-      line_total: round(net + lineTax),
+      line_total: round(taxableNet + lineTax),
     };
   });
   const charges = Math.max(0, num(extras.charges));
@@ -419,11 +431,15 @@ function computeTotals(lines, tier, extras = {}) {
     ? subtotal * Math.min(discountValue, 100) / 100
     : discountValue;
   const discount = Math.min(rawDiscount, subtotal + tax + charges);
-  const grand = subtotal + tax - discount + charges;
+  const rawGrand = subtotal + tax - discount + charges;
+  // Optional round-off: snap the total to the nearest whole unit and record the
+  // signed adjustment (between −0.5 and +0.5) so invoices can show a clean figure.
+  const roundOff = extras.roundOff ? round(Math.round(rawGrand) - rawGrand) : 0;
+  const grand = round(rawGrand + roundOff);
   return {
     subtotal: round(subtotal), tax: round(tax),
     discount: round(discount), discount_type: discountType, discount_value: round(discountValue),
-    charges: round(charges), grand: round(grand), lines: out,
+    charges: round(charges), round_off: roundOff, grand, lines: out,
   };
 }
 /** Keep an additional-charges note only when charges actually apply; trim/blank → null. */
