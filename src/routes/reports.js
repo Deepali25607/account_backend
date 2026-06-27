@@ -89,6 +89,51 @@ router.get("/outstanding", (req, res) => {
   res.json({ receivables, payables });
 });
 
+/** RP-07 Supplier Report By Item — net qty & value purchased per item, broken
+ * down by supplier, over a date range. Returns net confirmed (return docs
+ * subtracted). Optional ?vendor_id and ?item_id filters. */
+router.get("/supplier-by-item", (req, res) => {
+  const { from, to } = range(req);
+  const sign = "(CASE WHEN p.doc_type='return' THEN -1 ELSE 1 END)";
+  let sql = `SELECT i.name AS item, i.sku, v.name AS vendor,
+                    ROUND(SUM(${sign} * pl.qty), 3)        AS qty,
+                    ROUND(SUM(${sign} * pl.line_total) /
+                          NULLIF(SUM(${sign} * pl.qty), 0), 2) AS avg_price,
+                    ROUND(SUM(${sign} * pl.line_total), 2)  AS value,
+                    MAX(p.doc_date)                         AS last_purchase
+             FROM purchase_lines pl
+             JOIN purchases p ON p.id = pl.purchase_id
+             JOIN vendors v   ON v.id = p.vendor_id
+             JOIN items i     ON i.id = pl.item_id
+             WHERE p.tenant_id=? AND p.status='confirmed' AND p.doc_date BETWEEN ? AND ?`;
+  const params = [req.tenant.id, from, to];
+  if (req.query.vendor_id) { sql += " AND p.vendor_id=?"; params.push(req.query.vendor_id); }
+  if (req.query.item_id) { sql += " AND pl.item_id=?"; params.push(req.query.item_id); }
+  sql += " GROUP BY pl.item_id, p.vendor_id ORDER BY i.name, value DESC";
+  res.json(db.prepare(sql).all(...params));
+});
+
+/** RP-08 Supplier Wise Outstanding — per-supplier payables snapshot.
+ * Mirrors RP-06 payables (doc_type='purchase', outstanding = grand_total - paid)
+ * so totals reconcile, enriched with bill count, totals & oldest unpaid date
+ * (for aging). Point-in-time: ignores the date range. */
+router.get("/supplier-outstanding", (req, res) => {
+  res.json(
+    db.prepare(
+      `SELECT v.name AS vendor, v.phone,
+              COUNT(*)                                  AS bills,
+              ROUND(SUM(p.grand_total), 2)              AS total_billed,
+              ROUND(SUM(p.paid), 2)                     AS paid,
+              ROUND(SUM(p.grand_total - p.paid), 2)     AS outstanding,
+              MIN(CASE WHEN p.grand_total > p.paid THEN p.doc_date END) AS oldest_unpaid
+       FROM purchases p JOIN vendors v ON v.id = p.vendor_id
+       WHERE p.tenant_id=? AND p.doc_type='purchase'
+       GROUP BY p.vendor_id HAVING outstanding > 0
+       ORDER BY outstanding DESC`
+    ).all(req.tenant.id)
+  );
+});
+
 /** Dashboard rollup (powers the home screen KPIs + chart). */
 router.get("/dashboard", (req, res) => {
   const t = req.tenant.id;
