@@ -28,7 +28,10 @@ router.get("/payment-info", (req, res) => {
 router.post("/", requireRole(), (req, res) => {
   const { requested_tier, note } = req.body || {};
   if (!TIERS.includes(requested_tier)) return res.status(400).json({ error: "Invalid plan" });
-  if (requested_tier === req.tenant.tier) return res.status(400).json({ error: "You're already on that plan" });
+  // Trial tenants sit on 'premium' but haven't paid, so any tier (incl. the
+  // current one) is a valid first subscription. Paid tenants can't re-pick their plan.
+  const onTrial = !!req.tenant.trial_ends_at;
+  if (!onTrial && requested_tier === req.tenant.tier) return res.status(400).json({ error: "You're already on that plan" });
   const open = db.prepare(`SELECT id FROM plan_requests WHERE tenant_id=? AND status IN ('pending','awaiting_payment','payment_reported')`).get(req.tenant.id);
   if (open) return res.status(409).json({ error: "You already have a request in progress. Please wait for it to be processed." });
   const r = db.prepare(

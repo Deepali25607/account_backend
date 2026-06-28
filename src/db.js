@@ -391,6 +391,7 @@ ensureColumn("sale_lines", "discount_value", "discount_value REAL NOT NULL DEFAU
 ensureColumn("users", "is_platform_admin", "is_platform_admin INTEGER NOT NULL DEFAULT 0");
 ensureColumn("tenants", "active", "active INTEGER NOT NULL DEFAULT 1");   // org suspend/restore
 ensureColumn("tenants", "is_platform", "is_platform INTEGER NOT NULL DEFAULT 0"); // hidden platform tenant
+ensureColumn("tenants", "trial_ends_at", "trial_ends_at TEXT");          // 14-day free-trial expiry; NULL once on a paid plan
 // Company profile (owner-editable) — appears on invoices/receipts & GST documents.
 ensureColumn("tenants", "gstin", "gstin TEXT");          // GST identification number
 ensureColumn("tenants", "pan", "pan TEXT");              // PAN

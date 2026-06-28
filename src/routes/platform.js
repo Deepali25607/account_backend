@@ -139,7 +139,8 @@ router.post("/plan-requests/:id/activate", (req, res) => {
     return res.status(409).json({ error: "Approve and await payment before activating" });
   const tier = pr.requested_tier;
   db.transaction(() => {
-    db.prepare("UPDATE tenants SET tier=? WHERE id=?").run(tier, pr.tenant_id);
+    // Activating a paid plan ends the free trial (clears the lock for good).
+    db.prepare("UPDATE tenants SET tier=?, trial_ends_at=NULL WHERE id=?").run(tier, pr.tenant_id);
     if (tierHasFeature(tier, "accounting")) ensureChart(pr.tenant_id);
     if (tierHasFeature(tier, "multi_user")) ensureRolePermissions(pr.tenant_id);
     if (tierHasFeature(tier, "multi_location")) ensureDefaultLocation(pr.tenant_id);
@@ -208,7 +209,8 @@ router.patch("/orgs/:id/tier", (req, res) => {
   const t = db.prepare("SELECT * FROM tenants WHERE id = ? AND is_platform = 0").get(req.params.id);
   if (!t) return res.status(404).json({ error: "Organization not found" });
 
-  db.prepare("UPDATE tenants SET tier = ? WHERE id = ?").run(tier, t.id);
+  // A super-admin directly granting a plan also ends any running trial.
+  db.prepare("UPDATE tenants SET tier = ?, trial_ends_at = NULL WHERE id = ?").run(tier, t.id);
   // Seed tier scaffolding on upgrade (idempotent), mirroring owner self-upgrade.
   if (tierHasFeature(tier, "accounting")) ensureChart(t.id);
   if (tierHasFeature(tier, "multi_user")) ensureRolePermissions(t.id);

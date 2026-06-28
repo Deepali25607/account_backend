@@ -6,23 +6,27 @@ const { featuresForTier, USER_LIMITS, tierHasFeature } = require("../entitlement
 const { ensureChart } = require("../accounting");
 const { ensureRolePermissions } = require("../permissions");
 const { ensureDefaultLocation } = require("../locations");
+const { TRIAL_DAYS, trialStatus } = require("../trial");
 
 const router = express.Router();
 
-/** POST /api/auth/register — create a company (tenant) + owner user. */
+/** POST /api/auth/register — create a company (tenant) + owner user.
+ *  Every new company starts on a 14-day full-Premium free trial so they can try
+ *  every feature. When the trial ends they must choose & pay for a plan (the
+ *  upgrade request → payment → activation pipeline); activation clears the trial.
+ *  Until then an expired-trial org is locked to the billing page (see middleware). */
 router.post("/register", (req, res) => {
-  const { company, name, email, password, tier } = req.body || {};
+  const { company, name, email, password } = req.body || {};
   if (!company || !name || !email || !password)
     return res.status(400).json({ error: "company, name, email, password are required" });
 
-  const chosenTier = ["basic", "standard", "premium"].includes(tier) ? tier : "basic";
   const exists = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
   if (exists) return res.status(409).json({ error: "Email already registered" });
 
   const tx = db.transaction(() => {
     const t = db
-      .prepare("INSERT INTO tenants (name, tier) VALUES (?, ?)")
-      .run(company, chosenTier);
+      .prepare(`INSERT INTO tenants (name, tier, trial_ends_at) VALUES (?, 'premium', datetime('now', '+${TRIAL_DAYS} days'))`)
+      .run(company);
     const hash = bcrypt.hashSync(password, 10);
     const u = db
       .prepare(
@@ -34,6 +38,7 @@ router.post("/register", (req, res) => {
 
   const user = tx();
   const tenant = db.prepare("SELECT * FROM tenants WHERE id = ?").get(user.tenant_id);
+  // Premium trial unlocks everything, so provision all tier scaffolding up front.
   if (tierHasFeature(tenant.tier, "accounting")) ensureChart(tenant.id);
   if (tierHasFeature(tenant.tier, "multi_user")) ensureRolePermissions(tenant.id);
   if (tierHasFeature(tenant.tier, "multi_location")) ensureDefaultLocation(tenant.id);
@@ -136,6 +141,7 @@ function publicMe(user, tenant) {
     features: featuresForTier(tenant.tier),
     userLimit: USER_LIMITS[tenant.tier],
     platformAdmin: !!user.is_platform_admin,
+    trial: trialStatus(tenant),
   };
 }
 

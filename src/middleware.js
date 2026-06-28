@@ -1,6 +1,11 @@
 const jwt = require("jsonwebtoken");
 const db = require("./db");
 const { tierHasFeature } = require("./entitlements");
+const { trialStatus } = require("./trial");
+
+// When a trial has expired, the org is locked to these route groups so the owner
+// can still see plans, file a request and report payment to restore access.
+const TRIAL_LOCK_ALLOW = ["/api/auth", "/api/plan-requests"];
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 
@@ -27,6 +32,9 @@ function auth(req, res, next) {
     // A platform admin is exempt; a normal user of a suspended org is locked out.
     if (!user.is_platform_admin && tenant && tenant.active === 0)
       return res.status(403).json({ error: "org_suspended", message: "This organization has been suspended. Contact the platform administrator." });
+    // Expired free trial → lock to the billing flow until a plan is paid for.
+    if (!user.is_platform_admin && trialStatus(tenant).expired && !TRIAL_LOCK_ALLOW.includes(req.baseUrl))
+      return res.status(403).json({ error: "trial_expired", message: "Your 14-day free trial has ended. Choose a plan to continue." });
     req.user = user;
     req.tenant = tenant;
     next();
