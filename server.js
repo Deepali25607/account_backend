@@ -9,6 +9,11 @@ require("./src/db"); // initialise schema on boot
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Behind nginx (one proxy hop) so express-rate-limit keys on the real client IP
+// via X-Forwarded-For instead of lumping every user under 127.0.0.1 — otherwise
+// the shared auth limit could lock out all users at once.
+app.set("trust proxy", 1);
+
 app.use(cors());
 // Company backup imports can be large (full dataset + logo data-URL); give that
 // one path a roomier body limit before the global parser claims the request.
