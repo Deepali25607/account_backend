@@ -134,6 +134,58 @@ router.get("/supplier-outstanding", (req, res) => {
   );
 });
 
+/** RP-09 Customer Wise Outstanding — per-customer receivables snapshot with
+ * aging. Counts open invoices only (doc_type='sale', not cancelled, balance
+ * due) so it reconciles with the Payments screen's open-bill list; each
+ * invoice's balance falls into an aging bucket by days since doc_date.
+ * Point-in-time: ignores the date range. */
+router.get("/customer-outstanding", (req, res) => {
+  const age = "CAST(julianday('now') - julianday(s.doc_date) AS INTEGER)";
+  const bucket = (cond) => `ROUND(SUM(CASE WHEN ${cond} THEN s.grand_total - s.received ELSE 0 END), 2)`;
+  res.json(
+    db.prepare(
+      `SELECT c.name AS customer, c.phone,
+              COUNT(*)                                   AS bills,
+              ROUND(SUM(s.grand_total), 2)               AS total_billed,
+              ROUND(SUM(s.received), 2)                  AS received,
+              ROUND(SUM(s.grand_total - s.received), 2)  AS outstanding,
+              ${bucket(`${age} <= 30`)}                  AS "0-30",
+              ${bucket(`${age} BETWEEN 31 AND 60`)}      AS "31-60",
+              ${bucket(`${age} BETWEEN 61 AND 90`)}      AS "61-90",
+              ${bucket(`${age} > 90`)}                   AS "90+",
+              MIN(s.doc_date)                            AS oldest_unpaid
+       FROM sales s JOIN customers c ON c.id = s.customer_id
+       WHERE s.tenant_id=? AND s.doc_type='sale' AND s.status!='cancelled'
+         AND s.grand_total > s.received
+       GROUP BY s.customer_id
+       ORDER BY outstanding DESC`
+    ).all(req.tenant.id)
+  );
+});
+
+/** RP-10 Bill Wise Profit — per-invoice gross profit over a date range.
+ * Same basis as RP-05 so the rows sum to the Profit Estimate: revenue is the
+ * subtotal (net of line discounts, ex-tax, sign-flipped for returns) and cost
+ * is the stored cogs (already signed, negative on returns). Confirmed docs
+ * only. Optional ?customer_id filter. */
+router.get("/bill-profit", (req, res) => {
+  const { from, to } = range(req);
+  const sv = "(CASE WHEN s.doc_type='sale' THEN s.subtotal ELSE -s.subtotal END)";
+  let sql = `SELECT s.doc_no, s.doc_type, s.doc_date, c.name AS customer,
+                    ROUND(${sv}, 2)          AS sales_value,
+                    ROUND(s.cogs, 2)         AS cost_value,
+                    ROUND(${sv} - s.cogs, 2) AS gross_profit,
+                    CASE WHEN s.subtotal != 0
+                         THEN ROUND((${sv} - s.cogs) * 100.0 / ${sv}, 1)
+                         ELSE 0 END          AS margin_pct
+             FROM sales s JOIN customers c ON c.id=s.customer_id
+             WHERE s.tenant_id=? AND s.status='confirmed' AND s.doc_date BETWEEN ? AND ?`;
+  const params = [req.tenant.id, from, to];
+  if (req.query.customer_id) { sql += " AND s.customer_id=?"; params.push(req.query.customer_id); }
+  sql += " ORDER BY s.doc_date, s.id";
+  res.json(db.prepare(sql).all(...params));
+});
+
 /** Dashboard rollup (powers the home screen KPIs + chart). */
 router.get("/dashboard", (req, res) => {
   const t = req.tenant.id;
