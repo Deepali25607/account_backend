@@ -45,6 +45,7 @@ app.use("/api/manufacturing", require("./src/routes/manufacturing"));
 app.use("/api/users", require("./src/routes/users"));
 app.use("/api/locations", require("./src/routes/locations"));
 app.use("/api/payments", require("./src/routes/payments"));
+app.use("/api/expenses", require("./src/routes/expenses"));
 app.use("/api/plan-requests", require("./src/routes/plan-requests"));
 app.use("/api/platform", require("./src/routes/platform"));
 app.use("/api/backup", require("./src/routes/backup"));

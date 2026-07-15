@@ -207,6 +207,15 @@ router.get("/dashboard", (req, res) => {
        GROUP BY p.vendor_id HAVING outstanding > 0
      )`
   ).v;
+  // Customer outstanding (receivables) — sales-side mirror of the payables
+  // query above, counting only customers who are net owed.
+  const receivables = g(
+    `SELECT COALESCE(SUM(outstanding),0) v FROM (
+       SELECT SUM(s.grand_total - s.received) AS outstanding
+       FROM sales s WHERE s.tenant_id=? AND s.doc_type='sale'
+       GROUP BY s.customer_id HAVING outstanding > 0
+     )`
+  ).v;
   const counts = {
     items: g(`SELECT COUNT(*) c FROM items WHERE tenant_id=?`).c,
     customers: g(`SELECT COUNT(*) c FROM customers WHERE tenant_id=?`).c,
@@ -218,7 +227,7 @@ router.get("/dashboard", (req, res) => {
      FROM sales WHERE tenant_id=? AND doc_type='sale' AND doc_date >= date('now','-6 month')
      GROUP BY month ORDER BY month`
   ).all(t);
-  res.json({ sales30, purch30, stockValue: Math.round(stockValue * 100) / 100, payables: Math.round(payables * 100) / 100, lowStock, counts, trend });
+  res.json({ sales30, purch30, stockValue: Math.round(stockValue * 100) / 100, payables: Math.round(payables * 100) / 100, receivables: Math.round(receivables * 100) / 100, lowStock, counts, trend });
 });
 
 /**

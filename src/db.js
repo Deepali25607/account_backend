@@ -353,6 +353,30 @@ db.exec(`CREATE TABLE IF NOT EXISTS coupons (
   active          INTEGER NOT NULL DEFAULT 1,
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 )`);
+// Business expenses (rent, salaries, utilities, …) — recorded at every tier;
+// accounting tiers additionally get a balanced ledger posting per expense.
+db.exec(`CREATE TABLE IF NOT EXISTS expenses (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id    INTEGER NOT NULL REFERENCES tenants(id),
+  category     TEXT NOT NULL,
+  amount       REAL NOT NULL,
+  expense_date TEXT NOT NULL DEFAULT (date('now')),
+  account      TEXT NOT NULL DEFAULT 'cash' CHECK (account IN ('cash','bank')),
+  paid_to      TEXT,
+  note         TEXT,
+  created_by   INTEGER,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+)`);
+db.exec("CREATE INDEX IF NOT EXISTS idx_expenses_tenant ON expenses(tenant_id)");
+// User-defined expense categories (per tenant). Creating an expense with a new
+// category name auto-registers it here too, so the list keeps itself current.
+db.exec(`CREATE TABLE IF NOT EXISTS expense_categories (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id  INTEGER NOT NULL REFERENCES tenants(id),
+  name       TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (tenant_id, name)
+)`);
 // Payment received/paid at invoice time → which money account it hit (cash|bank)
 ensureColumn("sales", "payment_account", "payment_account TEXT NOT NULL DEFAULT 'cash'");
 ensureColumn("purchases", "payment_account", "payment_account TEXT NOT NULL DEFAULT 'cash'");

@@ -27,6 +27,7 @@ const DEFAULT_COA = {
   "5000": ["Cost of Goods Sold", "expense"],
   "5100": ["Discount Allowed", "expense"],          // additional discount on sales
   "5200": ["Purchase Expenses", "expense"],         // additional charges paid on purchases
+  "5300": ["Operating Expenses", "expense"],        // business expenses (rent, salaries, utilities, …)
 };
 
 /**
