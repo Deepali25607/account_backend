@@ -6,14 +6,20 @@ const db = require("./db");
 
 const getItem = (t, id) => db.prepare("SELECT * FROM items WHERE id=? AND tenant_id=?").get(id, t);
 
-/** BOM (with lines) that produces a given output item, or null if purchased. */
+/** BOM (with lines + expenses) that produces a given output item, or null if purchased. */
 function bomForItem(tenantId, itemId) {
   const bom = db.prepare("SELECT * FROM boms WHERE tenant_id=? AND item_id=?").get(tenantId, itemId);
   if (!bom) return null;
   bom.lines = db.prepare(
     `SELECT bl.*, i.name AS item_name, i.sku, i.cost_price FROM bom_lines bl JOIN items i ON i.id=bl.item_id WHERE bl.bom_id=?`
   ).all(bom.id);
+  bom.expenses = db.prepare("SELECT * FROM bom_expenses WHERE bom_id=?").all(bom.id);
   return bom;
+}
+
+/** Additional (non-material) cost of one build batch. */
+function expenseTotal(bom) {
+  return (bom.expenses || []).reduce((s, e) => s + Number(e.amount || 0), 0);
 }
 
 /** MF-09: rolled-up cost to produce one output unit (recurses through sub-assemblies). */
@@ -23,7 +29,7 @@ function rollupCost(tenantId, itemId, depth = 0) {
     const it = getItem(tenantId, itemId);
     return it ? it.cost_price : 0;
   }
-  let total = 0;
+  let total = expenseTotal(bom);
   for (const ln of bom.lines) total += rollupCost(tenantId, ln.item_id, depth + 1) * ln.qty;
   return round(total / (bom.output_qty || 1));
 }
@@ -71,4 +77,4 @@ function runMrp(tenantId, orders) {
 
 function round(n) { return Math.round((Number(n || 0) + Number.EPSILON) * 1000) / 1000; }
 
-module.exports = { getItem, bomForItem, rollupCost, runMrp, round };
+module.exports = { getItem, bomForItem, expenseTotal, rollupCost, runMrp, round };

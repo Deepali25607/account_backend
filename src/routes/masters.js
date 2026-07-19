@@ -61,22 +61,34 @@ router.get("/items", requireFeature("inventory"), (req, res) => {
   res.json(db.prepare(`SELECT * FROM items ${where} ORDER BY name`).all(...params));
 });
 
+// Alternate unit is stored as a pair: name + conversion factor (1 alt = X base).
+// Returns {alt_uom, alt_uom_factor} or an {error} when the pair is inconsistent.
+function normAltUom(alt_uom, alt_uom_factor) {
+  const name = normText(alt_uom);
+  if (!name) return { alt_uom: null, alt_uom_factor: null };
+  const factor = num(alt_uom_factor);
+  if (!(factor > 0)) return { error: "Conversion factor is required for the alternate unit (1 alternate unit = how many base units?)" };
+  return { alt_uom: name, alt_uom_factor: factor };
+}
+
 router.post("/items", requireFeature("inventory"), requirePermission("inventory", "create"), (req, res) => {
-  const { sku, name, category, material_type, uom, cost_price, sale_price, tax_rate, stock_qty, reorder_lvl, barcode, hsn } =
+  const { sku, name, category, material_type, uom, alt_uom, alt_uom_factor, cost_price, sale_price, tax_rate, stock_qty, reorder_lvl, barcode, hsn } =
     req.body || {};
   if (!name) return res.status(400).json({ error: "name is required" });
   if (!material_type || !validMaterial(material_type))
     return res.status(400).json({ error: `material_type is required and must be one of: ${MATERIAL_TYPES.join(", ")}` });
+  const alt = normAltUom(alt_uom, alt_uom_factor);
+  if (alt.error) return res.status(400).json({ error: alt.error });
   // SKU is optional — auto-generate from the material type when omitted (e.g. FG-00001).
   const finalSku = (sku ?? "").toString().trim() || nextSku(req.tenant.id, material_type);
   try {
     const r = db
       .prepare(
-        `INSERT INTO items (tenant_id, sku, name, category, material_type, uom, cost_price, sale_price, tax_rate, stock_qty, reorder_lvl, barcode, hsn)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+        `INSERT INTO items (tenant_id, sku, name, category, material_type, uom, alt_uom, alt_uom_factor, cost_price, sale_price, tax_rate, stock_qty, reorder_lvl, barcode, hsn)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
-        req.tenant.id, finalSku, name, category || null, material_type, uom || "unit",
+        req.tenant.id, finalSku, name, category || null, material_type, uom || "unit", alt.alt_uom, alt.alt_uom_factor,
         num(cost_price), num(sale_price), num(tax_rate), num(stock_qty), num(reorder_lvl), normBarcode(barcode), normText(hsn)
       );
     if (num(stock_qty) !== 0) recordMovement(req.tenant.id, r.lastInsertRowid, num(stock_qty), "opening", "item", r.lastInsertRowid);
@@ -100,8 +112,8 @@ router.post("/items/bulk", requireFeature("inventory"), requirePermission("inven
   if (list.length > 1000) return res.status(400).json({ error: "Too many rows — import up to 1000 at a time" });
 
   const insert = db.prepare(
-    `INSERT INTO items (tenant_id, sku, name, category, material_type, uom, cost_price, sale_price, tax_rate, stock_qty, reorder_lvl, barcode, hsn)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO items (tenant_id, sku, name, category, material_type, uom, alt_uom, alt_uom_factor, cost_price, sale_price, tax_rate, stock_qty, reorder_lvl, barcode, hsn)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   );
   const created = [];
   const failed = [];
@@ -113,9 +125,12 @@ router.post("/items/bulk", requireFeature("inventory"), requirePermission("inven
     try {
       if (!name) throw new Error("name is required");
       if (!validMaterial(material_type)) throw new Error(`material_type must be one of: ${MATERIAL_TYPES.join(", ")}`);
+      const alt = normAltUom(raw.alt_uom, raw.alt_uom_factor);
+      if (alt.error) throw new Error(alt.error);
       const skuFinal = sku || nextSku(req.tenant.id, material_type); // auto-generate when blank
       const r = insert.run(
         req.tenant.id, skuFinal, name, normText(raw.category), material_type, (raw.uom ?? "").toString().trim() || "unit",
+        alt.alt_uom, alt.alt_uom_factor,
         num(raw.cost_price), num(raw.sale_price), num(raw.tax_rate), num(raw.stock_qty), num(raw.reorder_lvl),
         normBarcode(raw.barcode), normText(raw.hsn)
       );
@@ -136,15 +151,22 @@ router.post("/items/bulk", requireFeature("inventory"), requirePermission("inven
 router.put("/items/:id", requireFeature("inventory"), requirePermission("inventory", "edit"), (req, res) => {
   const item = getItem(req.tenant.id, req.params.id);
   if (!item) return res.status(404).json({ error: "Item not found" });
-  const { name, category, material_type, uom, cost_price, sale_price, tax_rate, reorder_lvl, barcode, hsn } = req.body || {};
+  const { name, category, material_type, uom, alt_uom, alt_uom_factor, cost_price, sale_price, tax_rate, reorder_lvl, barcode, hsn } = req.body || {};
   if (material_type !== undefined && !validMaterial(material_type))
     return res.status(400).json({ error: `material_type must be one of: ${MATERIAL_TYPES.join(", ")}` });
+  // Alternate unit updates as a pair; untouched requests keep the stored pair.
+  let alt = { alt_uom: item.alt_uom, alt_uom_factor: item.alt_uom_factor };
+  if (alt_uom !== undefined || alt_uom_factor !== undefined) {
+    alt = normAltUom(alt_uom !== undefined ? alt_uom : item.alt_uom, alt_uom_factor !== undefined ? alt_uom_factor : item.alt_uom_factor);
+    if (alt.error) return res.status(400).json({ error: alt.error });
+  }
   try {
     db.prepare(
-      `UPDATE items SET name=?, category=?, material_type=?, uom=?, cost_price=?, sale_price=?, tax_rate=?, reorder_lvl=?, barcode=?, hsn=?
+      `UPDATE items SET name=?, category=?, material_type=?, uom=?, alt_uom=?, alt_uom_factor=?, cost_price=?, sale_price=?, tax_rate=?, reorder_lvl=?, barcode=?, hsn=?
        WHERE id=? AND tenant_id=?`
     ).run(
       name ?? item.name, category ?? item.category, material_type ?? item.material_type, uom ?? item.uom,
+      alt.alt_uom, alt.alt_uom_factor,
       num(cost_price ?? item.cost_price), num(sale_price ?? item.sale_price),
       num(tax_rate ?? item.tax_rate), num(reorder_lvl ?? item.reorder_lvl),
       barcode !== undefined ? normBarcode(barcode) : (item.barcode || null),

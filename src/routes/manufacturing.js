@@ -2,7 +2,7 @@ const express = require("express");
 const db = require("../db");
 const { auth, requireFeature, logAction } = require("../middleware");
 const { recordMovement } = require("./masters");
-const { getItem, bomForItem, rollupCost, runMrp, round } = require("../manufacturing");
+const { getItem, bomForItem, expenseTotal, rollupCost, runMrp, round } = require("../manufacturing");
 
 const router = express.Router();
 router.use(auth);
@@ -18,36 +18,81 @@ router.get("/boms", (req, res) => {
     b.lines = db.prepare(
       `SELECT bl.*, i.name AS item_name, i.sku FROM bom_lines bl JOIN items i ON i.id=bl.item_id WHERE bl.bom_id=?`
     ).all(b.id);
+    b.expenses = db.prepare("SELECT * FROM bom_expenses WHERE bom_id=?").all(b.id);
     b.rolled_cost = rollupCost(req.tenant.id, b.item_id);
   }
   res.json(boms);
 });
 
-router.post("/boms", (req, res) => {
-  const { item_id, name, output_qty, std_cost, lines } = req.body || {};
-  if (!item_id || !name) return res.status(400).json({ error: "item_id and name are required" });
-  if (!Array.isArray(lines) || !lines.length) return res.status(400).json({ error: "At least one component is required" });
+/**
+ * Additional expenses (labour, electricity, packaging…) — optional, per build batch.
+ * 'fixed' rows carry an amount; 'labour' rows derive it from the employee's
+ * monthly salary and working hours: salary / monthly_hours * hours_used.
+ * Returns { rows } or { error }.
+ */
+function parseExpenseRows(expenses) {
+  const rows = (Array.isArray(expenses) ? expenses : [])
+    .map((e) => ({
+      basis: e?.basis === "labour" ? "labour" : "fixed",
+      name: (e?.name ?? "").toString().trim(),
+      amount: Number(e?.amount),
+      monthly_salary: Number(e?.monthly_salary),
+      monthly_hours: Number(e?.monthly_hours),
+      hours_used: Number(e?.hours_used),
+    }))
+    .filter((e) => e.name || e.amount || e.monthly_salary || e.hours_used); // ignore fully blank rows
+  for (const e of rows) {
+    if (!e.name) return { error: "Each additional expense needs a name" };
+    if (e.basis === "labour") {
+      if (!(e.monthly_salary > 0)) return { error: `Labour expense "${e.name}" needs a positive monthly salary` };
+      if (!(e.monthly_hours > 0)) return { error: `Labour expense "${e.name}" needs the monthly working hours` };
+      if (!(e.hours_used > 0)) return { error: `Labour expense "${e.name}" needs the hours consumed per build` };
+      e.amount = round(e.monthly_salary / e.monthly_hours * e.hours_used);
+    } else {
+      if (!(e.amount > 0)) return { error: `Additional expense "${e.name}" needs a positive amount` };
+      e.monthly_salary = e.monthly_hours = e.hours_used = null;
+    }
+  }
+  return { rows };
+}
+
+/** Shared create/update validation of the output item and component lines. */
+function validateBomShape(tenantId, item_id, name, lines) {
+  if (!item_id || !name) return "item_id and name are required";
+  if (!Array.isArray(lines) || !lines.length) return "At least one component is required";
   if (lines.some((l) => Number(l.item_id) === Number(item_id)))
-    return res.status(400).json({ error: "A BOM cannot include its own output item as a component" });
+    return "A BOM cannot include its own output item as a component";
+  // Material type drives manufacturability: only Finished/Semi-Finished items are produced.
+  const output = getItem(tenantId, item_id);
+  if (!output) return "Output item not found";
+  if (!["finished", "semi_finished"].includes(output.material_type))
+    return "Only Finished or Semi-Finished items can have a BOM (set the item's Material Type)";
+  for (const l of lines) {
+    const comp = getItem(tenantId, l.item_id);
+    if (comp && comp.material_type === "service") return `Service items (${comp.name}) cannot be BOM components`;
+  }
+  return null;
+}
+
+router.post("/boms", (req, res) => {
+  const { item_id, name, output_qty, std_cost, lines, expenses } = req.body || {};
+  const shapeErr = validateBomShape(req.tenant.id, item_id, name, lines);
+  if (shapeErr) return res.status(400).json({ error: shapeErr });
+  const exp = parseExpenseRows(expenses);
+  if (exp.error) return res.status(400).json({ error: exp.error });
+  const expRows = exp.rows;
   if (db.prepare("SELECT id FROM boms WHERE tenant_id=? AND item_id=?").get(req.tenant.id, item_id))
     return res.status(409).json({ error: "This item already has a BOM" });
-
-  // Material type drives manufacturability: only Finished/Semi-Finished items are produced.
-  const output = getItem(req.tenant.id, item_id);
-  if (!output) return res.status(400).json({ error: "Output item not found" });
-  if (!["finished", "semi_finished"].includes(output.material_type))
-    return res.status(400).json({ error: "Only Finished or Semi-Finished items can have a BOM (set the item's Material Type)" });
-  for (const l of lines) {
-    const comp = getItem(req.tenant.id, l.item_id);
-    if (comp && comp.material_type === "service")
-      return res.status(400).json({ error: `Service items (${comp.name}) cannot be BOM components` });
-  }
 
   const id = db.transaction(() => {
     const b = db.prepare("INSERT INTO boms (tenant_id, item_id, name, output_qty, std_cost) VALUES (?,?,?,?,?)")
       .run(req.tenant.id, item_id, name, Number(output_qty) || 1, Number(std_cost) || 0);
     const ins = db.prepare("INSERT INTO bom_lines (bom_id, item_id, qty) VALUES (?,?,?)");
     for (const l of lines) if (l.item_id && Number(l.qty) > 0) ins.run(b.lastInsertRowid, l.item_id, Number(l.qty));
+    const insExp = db.prepare(
+      "INSERT INTO bom_expenses (bom_id, name, basis, monthly_salary, monthly_hours, hours_used, amount) VALUES (?,?,?,?,?,?,?)"
+    );
+    for (const e of expRows) insExp.run(b.lastInsertRowid, e.name, e.basis, e.monthly_salary, e.monthly_hours, e.hours_used, e.amount);
     db.prepare("UPDATE items SET is_manufactured=1 WHERE id=? AND tenant_id=?").run(item_id, req.tenant.id);
     return b.lastInsertRowid;
   })();
@@ -55,11 +100,63 @@ router.post("/boms", (req, res) => {
   res.status(201).json(bomForItem(req.tenant.id, item_id));
 });
 
+/**
+ * MF-02: edit a BOM. Lines and expenses are replaced wholesale. Editing only
+ * affects future cost rollups and completions — costs already absorbed into
+ * finished goods by past production runs are not restated.
+ */
+router.put("/boms/:id", (req, res) => {
+  const bom = db.prepare("SELECT * FROM boms WHERE id=? AND tenant_id=?").get(req.params.id, req.tenant.id);
+  if (!bom) return res.status(404).json({ error: "Not found" });
+  const { item_id, name, output_qty, std_cost, lines, expenses } = req.body || {};
+  const outId = Number(item_id) || bom.item_id;
+  const shapeErr = validateBomShape(req.tenant.id, outId, name, lines);
+  if (shapeErr) return res.status(400).json({ error: shapeErr });
+  const exp = parseExpenseRows(expenses);
+  if (exp.error) return res.status(400).json({ error: exp.error });
+  if (outId !== bom.item_id && db.prepare("SELECT id FROM boms WHERE tenant_id=? AND item_id=?").get(req.tenant.id, outId))
+    return res.status(409).json({ error: "That item already has a BOM" });
+
+  db.transaction(() => {
+    db.prepare("UPDATE boms SET item_id=?, name=?, output_qty=?, std_cost=? WHERE id=?")
+      .run(outId, name, Number(output_qty) || 1, Number(std_cost) || 0, bom.id);
+    db.prepare("DELETE FROM bom_lines WHERE bom_id=?").run(bom.id);
+    db.prepare("DELETE FROM bom_expenses WHERE bom_id=?").run(bom.id);
+    const ins = db.prepare("INSERT INTO bom_lines (bom_id, item_id, qty) VALUES (?,?,?)");
+    for (const l of lines) if (l.item_id && Number(l.qty) > 0) ins.run(bom.id, l.item_id, Number(l.qty));
+    const insExp = db.prepare(
+      "INSERT INTO bom_expenses (bom_id, name, basis, monthly_salary, monthly_hours, hours_used, amount) VALUES (?,?,?,?,?,?,?)"
+    );
+    for (const e of exp.rows) insExp.run(bom.id, e.name, e.basis, e.monthly_salary, e.monthly_hours, e.hours_used, e.amount);
+    if (outId !== bom.item_id) {
+      db.prepare("UPDATE items SET is_manufactured=0 WHERE id=? AND tenant_id=?").run(bom.item_id, req.tenant.id);
+      db.prepare("UPDATE items SET is_manufactured=1 WHERE id=? AND tenant_id=?").run(outId, req.tenant.id);
+    }
+  })();
+  logAction(req, "update", "bom", bom.id);
+  res.json(bomForItem(req.tenant.id, outId));
+});
+
+/**
+ * Delete a BOM. Blocked while orders are open or once any order has produced
+ * stock with it (history is never orphaned — same policy as item deletion).
+ * Abandoned orders (closed, nothing produced) are removed along with the BOM.
+ */
 router.delete("/boms/:id", (req, res) => {
   const bom = db.prepare("SELECT * FROM boms WHERE id=? AND tenant_id=?").get(req.params.id, req.tenant.id);
   if (!bom) return res.status(404).json({ error: "Not found" });
-  db.prepare("DELETE FROM boms WHERE id=?").run(bom.id);
-  db.prepare("UPDATE items SET is_manufactured=0 WHERE id=?").run(bom.item_id);
+  const open = db.prepare("SELECT COUNT(*) c FROM production_orders WHERE bom_id=? AND status IN ('planned','in_progress')").get(bom.id).c;
+  if (open)
+    return res.status(409).json({ error: `Can't delete this BOM — ${open} production order(s) are planned or in progress. Complete or close them first.` });
+  const produced = db.prepare("SELECT COUNT(*) c FROM production_orders WHERE bom_id=? AND completed_qty > 0").get(bom.id).c;
+  if (produced)
+    return res.status(409).json({ error: `Can't delete this BOM — ${produced} production order(s) already produced stock with it, so it's kept for history.` });
+  db.transaction(() => {
+    db.prepare("DELETE FROM production_orders WHERE bom_id=?").run(bom.id); // only closed, zero-progress orders remain here
+    db.prepare("DELETE FROM boms WHERE id=?").run(bom.id); // lines & expenses cascade
+    db.prepare("UPDATE items SET is_manufactured=0 WHERE id=? AND tenant_id=?").run(bom.item_id, req.tenant.id);
+  })();
+  logAction(req, "delete", "bom", bom.id);
   res.json({ ok: true });
 });
 
@@ -124,8 +221,10 @@ router.post("/production-orders/:id/complete", (req, res) => {
       db.prepare("UPDATE items SET stock_qty = stock_qty - ? WHERE id=?").run(r.need, r.item_id);
       recordMovement(req.tenant.id, r.item_id, -r.need, "production_consume", "production_order", po.id);
     }
+    // Overhead (labour, electricity…) scales with the produced share of a build batch.
+    const expenseCost = expenseTotal(bom) * qty / (bom.output_qty || 1);
     const fg = getItem(req.tenant.id, bom.item_id);
-    const unitCost = qty > 0 ? componentCost / qty : fg.cost_price;
+    const unitCost = qty > 0 ? (componentCost + expenseCost) / qty : fg.cost_price;
     const newQty = fg.stock_qty + qty;
     const newCost = newQty > 0 ? (fg.stock_qty * fg.cost_price + qty * unitCost) / newQty : unitCost;
     db.prepare("UPDATE items SET stock_qty=?, cost_price=? WHERE id=?").run(round(newQty), round(newCost), fg.id);

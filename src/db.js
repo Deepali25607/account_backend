@@ -71,6 +71,8 @@ function init() {
       category    TEXT,
       material_type TEXT  NOT NULL DEFAULT 'trading',  -- user-defined classification (not auto-derived)
       uom         TEXT    NOT NULL DEFAULT 'unit',
+      alt_uom     TEXT,                          -- optional alternate unit (e.g. box)
+      alt_uom_factor REAL,                       -- 1 alt_uom = X uom
       cost_price  REAL    NOT NULL DEFAULT 0,   -- weighted-avg cost (IN-05)
       sale_price  REAL    NOT NULL DEFAULT 0,
       tax_rate    REAL    NOT NULL DEFAULT 0,   -- GST % (Standard+)
@@ -247,6 +249,21 @@ function init() {
       qty         REAL    NOT NULL
     );
 
+    -- Non-material costs of a build (labour, electricity, packaging, job work).
+    -- Amounts are per build batch (i.e. per output_qty units of the output item).
+    -- basis 'fixed': amount entered directly. basis 'labour': amount derived as
+    -- monthly_salary / monthly_hours * hours_used (stored for cost rollups).
+    CREATE TABLE IF NOT EXISTS bom_expenses (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      bom_id      INTEGER NOT NULL REFERENCES boms(id) ON DELETE CASCADE,
+      name        TEXT    NOT NULL,
+      basis       TEXT    NOT NULL DEFAULT 'fixed',
+      monthly_salary REAL,
+      monthly_hours  REAL,
+      hours_used     REAL,
+      amount      REAL    NOT NULL DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS production_orders (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       tenant_id   INTEGER NOT NULL REFERENCES tenants(id),
@@ -290,6 +307,12 @@ ensureColumn("production_orders", "completed_qty", "completed_qty REAL NOT NULL 
 ensureColumn("purchases", "location_id", "location_id INTEGER");
 ensureColumn("sales", "location_id", "location_id INTEGER");
 ensureColumn("items", "material_type", "material_type TEXT NOT NULL DEFAULT 'trading'");
+ensureColumn("items", "alt_uom", "alt_uom TEXT");
+ensureColumn("items", "alt_uom_factor", "alt_uom_factor REAL");
+ensureColumn("bom_expenses", "basis", "basis TEXT NOT NULL DEFAULT 'fixed'");
+ensureColumn("bom_expenses", "monthly_salary", "monthly_salary REAL");
+ensureColumn("bom_expenses", "monthly_hours", "monthly_hours REAL");
+ensureColumn("bom_expenses", "hours_used", "hours_used REAL");
 ensureColumn("items", "barcode", "barcode TEXT");   // IN-01: scannable barcode / EAN
 ensureColumn("items", "hsn", "hsn TEXT");           // GST HSN/SAC code (master-defined)
 // Party (supplier/customer) address & contact details — added for fuller master records.
