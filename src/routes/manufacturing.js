@@ -287,6 +287,55 @@ router.post("/production-orders/:id/draft-po", (req, res) => {
   res.status(201).json(db.prepare("SELECT * FROM purchases WHERE id=?").get(id));
 });
 
+/**
+ * Sales-enquiry requirement calculator. Body: { demands: [{item_id, qty}] }.
+ * Explodes the demanded finished goods through their BOMs (multi-level, netting
+ * current stock at every level, same engine as MRP) and returns what to
+ * produce, what raw material to arrange, and the labour time needed — derived
+ * from each BOM's labour expense rows (hours per build × builds required).
+ */
+router.post("/requirements", (req, res) => {
+  const demands = Array.isArray(req.body?.demands) ? req.body.demands : [];
+  const clean = [];
+  for (const d of demands) {
+    const item = getItem(req.tenant.id, d?.item_id);
+    if (!item) return res.status(400).json({ error: "Unknown item in the demand list" });
+    if (!(Number(d.qty) > 0)) return res.status(400).json({ error: `Quantity for ${item.name} must be positive` });
+    clean.push({ item, qty: Number(d.qty) });
+  }
+  if (!clean.length) return res.status(400).json({ error: "Add at least one item with a quantity" });
+
+  // Seed the MRP engine with the demand itself via a pseudo-BOM so the demanded
+  // goods are netted against stock and exploded exactly like sub-assemblies.
+  const pseudo = { output_qty: 1, lines: clean.map((c) => ({ item_id: c.item.id, qty: c.qty })) };
+  const mrp = runMrp(req.tenant.id, [{ bom: pseudo, qty: 1 }]);
+
+  let totalHours = 0, totalLabourCost = 0, totalOtherCost = 0;
+  const produce = mrp.produce.map((p) => {
+    const bom = bomForItem(req.tenant.id, p.item_id);
+    const builds = bom && p.net > 0 ? p.net / (bom.output_qty || 1) : 0;
+    const labour = (bom?.expenses || [])
+      .filter((e) => e.basis === "labour")
+      .map((e) => ({ name: e.name, hours: round((e.hours_used || 0) * builds), cost: round(e.amount * builds) }));
+    const labour_hours = round(labour.reduce((s, l) => s + l.hours, 0));
+    const labour_cost = round(labour.reduce((s, l) => s + l.cost, 0));
+    const other_expense_cost = round((bom?.expenses || []).filter((e) => e.basis !== "labour").reduce((s, e) => s + e.amount * builds, 0));
+    totalHours = round(totalHours + labour_hours);
+    totalLabourCost = round(totalLabourCost + labour_cost);
+    totalOtherCost = round(totalOtherCost + other_expense_cost);
+    return { ...p, output_qty: bom?.output_qty || 1, builds: round(builds), labour_hours, labour_cost, other_expense_cost, labour };
+  });
+  // Anything demanded or exploded that has no BOM lands here — it must be bought.
+  const purchase = mrp.purchase.map((p) => ({ ...p, est_cost: round(p.net * p.cost_price) }));
+  res.json({
+    produce, purchase,
+    total_hours: totalHours,
+    total_labour_cost: totalLabourCost,
+    total_other_expense_cost: totalOtherCost,
+    purchase_cost: round(purchase.reduce((s, p) => s + p.est_cost, 0)),
+  });
+});
+
 /* ───────────────────────── Reports (MF-08) ───────────────────────── */
 
 /** BOM cost rollup vs standard cost (variance). */
