@@ -21,6 +21,9 @@ const FEATURES = {
   // Premium only
   manufacturing: ["premium"],
   multi_location: ["premium"],  // IN-06 multi-warehouse stock tracking
+  // NOTE: the AI assistant is NOT tier-based — it's a paid add-on toggled
+  // per tenant by the platform super admin (tenants.ai_enabled). The
+  // ai_assistant flag the frontend sees is added in publicMe (auth.js).
 };
 
 const TIER_RANK = { basic: 1, standard: 2, premium: 3 };

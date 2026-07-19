@@ -309,6 +309,7 @@ ensureColumn("sales", "location_id", "location_id INTEGER");
 ensureColumn("items", "material_type", "material_type TEXT NOT NULL DEFAULT 'trading'");
 ensureColumn("items", "alt_uom", "alt_uom TEXT");
 ensureColumn("items", "alt_uom_factor", "alt_uom_factor REAL");
+ensureColumn("tenants", "sale_form_settings", "sale_form_settings TEXT"); // JSON; NULL = all features shown
 ensureColumn("bom_expenses", "basis", "basis TEXT NOT NULL DEFAULT 'fixed'");
 ensureColumn("bom_expenses", "monthly_salary", "monthly_salary REAL");
 ensureColumn("bom_expenses", "monthly_hours", "monthly_hours REAL");
@@ -450,5 +451,16 @@ ensureColumn("tenants", "city", "city TEXT");
 ensureColumn("tenants", "state", "state TEXT");
 ensureColumn("tenants", "pincode", "pincode TEXT");
 ensureColumn("tenants", "logo", "logo TEXT");           // company logo as a data-URL (shown on invoices)
+// AI assistant is a PAID ADD-ON, granted per organization by the platform
+// super admin (not part of any tier). Default off for every org incl. trials.
+ensureColumn("tenants", "ai_enabled", "ai_enabled INTEGER NOT NULL DEFAULT 0");
+// AI assistant ("Ask your books") — per-tenant daily request counter so one org
+// can't run up the Claude API bill; rows are (tenant, day) and reset naturally.
+db.exec(`CREATE TABLE IF NOT EXISTS ai_usage (
+  tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+  day       TEXT    NOT NULL,
+  count     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (tenant_id, day)
+)`);
 
 module.exports = db;

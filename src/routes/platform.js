@@ -172,6 +172,7 @@ router.get("/orgs", (req, res) => {
     sales: countFor(t.id, "sales"),
     userLimit: USER_LIMITS[t.tier],
     features: featuresForTier(t.tier),
+    aiEnabled: !!t.ai_enabled,
   }));
   res.json(rows);
 });
@@ -216,6 +217,18 @@ router.patch("/orgs/:id/tier", (req, res) => {
   if (tierHasFeature(tier, "multi_user")) ensureRolePermissions(t.id);
   if (tierHasFeature(tier, "multi_location")) ensureDefaultLocation(t.id);
   res.json({ id: t.id, tier, features: featuresForTier(tier), userLimit: USER_LIMITS[tier] });
+});
+
+/** PATCH /platform/orgs/:id/ai — grant/revoke the paid AI-assistant add-on.
+ *  The add-on is billed separately from the plan, so only the super admin can
+ *  switch it on (after payment) or off — tenants cannot self-enable. */
+router.patch("/orgs/:id/ai", (req, res) => {
+  const { enabled } = req.body || {};
+  if (typeof enabled !== "boolean") return res.status(400).json({ error: "enabled (boolean) required" });
+  const t = db.prepare("SELECT * FROM tenants WHERE id = ? AND is_platform = 0").get(req.params.id);
+  if (!t) return res.status(404).json({ error: "Organization not found" });
+  db.prepare("UPDATE tenants SET ai_enabled = ? WHERE id = ?").run(enabled ? 1 : 0, t.id);
+  res.json({ id: t.id, aiEnabled: enabled });
 });
 
 /** PATCH /platform/orgs/:id/status — suspend or restore an org's access. */

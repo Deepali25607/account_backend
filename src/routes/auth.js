@@ -103,6 +103,45 @@ router.put("/me/company", auth, requireRole(), (req, res) => {
   res.json(publicMe(req.user, tenant));
 });
 
+/**
+ * Sale invoice form customization (owner only). Each key toggles one optional
+ * block of the sale form so orgs that don't need a feature get a simpler form.
+ * All keys default to true (shown); settings only store deviations.
+ */
+const SALE_FORM_KEYS = [
+  "doc_type",        // Sale invoice / Credit note selector
+  "warehouse",       // issue-from warehouse selector (multi-location tiers)
+  "barcode_bar",     // barcode scan bar + camera
+  "tax_mode",        // GST inclusive / exclusive switch
+  "oversell",        // allow-overselling override checkbox
+  "discount",        // additional (bill-level) discount
+  "extra_charges",   // additional charges + note
+  "round_off",       // round-off toggle
+  "payment_account", // Cash / Bank selector next to amount received
+  "print_step",      // post-save print / receipt step
+  "whatsapp",        // WhatsApp share actions
+];
+
+function saleFormOf(tenant) {
+  let stored = {};
+  try { stored = JSON.parse(tenant.sale_form_settings || "{}") || {}; } catch {}
+  const out = {};
+  for (const k of SALE_FORM_KEYS) out[k] = stored[k] === false ? false : true;
+  return out;
+}
+
+/** PUT /api/auth/me/sale-form — owner customizes which sale-form features show. */
+router.put("/me/sale-form", auth, requireRole(), (req, res) => {
+  const b = req.body || {};
+  const settings = {};
+  for (const k of SALE_FORM_KEYS) if (b[k] === false) settings[k] = false; // store only what's hidden
+  db.prepare("UPDATE tenants SET sale_form_settings=? WHERE id=?")
+    .run(Object.keys(settings).length ? JSON.stringify(settings) : null, req.tenant.id);
+  logAction(req, "update", "sale_form_settings", req.tenant.id);
+  const tenant = db.prepare("SELECT * FROM tenants WHERE id = ?").get(req.tenant.id);
+  res.json(publicMe(req.user, tenant));
+});
+
 /** GET /api/auth/pricing — current plan price list (read-only for tenants). */
 router.get("/pricing", auth, (req, res) => {
   res.json(require("../pricing").getPricing());
@@ -138,7 +177,9 @@ function publicMe(user, tenant) {
       website: tenant.website || "", address: tenant.address || "", city: tenant.city || "",
       state: tenant.state || "", pincode: tenant.pincode || "", logo: tenant.logo || "",
     },
-    features: featuresForTier(tenant.tier),
+    saleForm: saleFormOf(tenant),
+    // AI assistant is a super-admin-granted paid add-on, not part of the tier.
+    features: { ...featuresForTier(tenant.tier), ai_assistant: !!tenant.ai_enabled },
     userLimit: USER_LIMITS[tenant.tier],
     platformAdmin: !!user.is_platform_admin,
     trial: trialStatus(tenant),
