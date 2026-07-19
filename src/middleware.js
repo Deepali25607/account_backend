@@ -33,7 +33,12 @@ function auth(req, res, next) {
     if (!user.is_platform_admin && tenant && tenant.active === 0)
       return res.status(403).json({ error: "org_suspended", message: "This organization has been suspended. Contact the platform administrator." });
     // Expired free trial → lock to the billing flow until a plan is paid for.
-    if (!user.is_platform_admin && trialStatus(tenant).expired && !TRIAL_LOCK_ALLOW.includes(req.baseUrl))
+    // Match on the full path, not req.baseUrl: auth also runs inside routers
+    // mounted at bare "/api" (masters, transactions), where baseUrl is "/api"
+    // even for a /api/plan-requests request passing through.
+    const fullPath = req.baseUrl + req.path;
+    const trialAllowed = TRIAL_LOCK_ALLOW.some((p) => fullPath === p || fullPath.startsWith(p + "/"));
+    if (!user.is_platform_admin && trialStatus(tenant).expired && !trialAllowed)
       return res.status(403).json({ error: "trial_expired", message: "Your 14-day free trial has ended. Choose a plan to continue." });
     req.user = user;
     req.tenant = tenant;
