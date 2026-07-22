@@ -186,6 +186,31 @@ router.get("/bill-profit", (req, res) => {
   res.json(db.prepare(sql).all(...params));
 });
 
+/** RP-11 Category Wise Profit — line-level rollup of confirmed sales by item
+ * category over a date range (returns netted out). Line-level cost at sale time
+ * isn't stored (only the bill's total cogs), so cost uses each item's current
+ * weighted-average cost_price — an estimate that can drift from RP-05/RP-10
+ * totals when purchase prices have changed since the sale. */
+router.get("/category-profit", (req, res) => {
+  const { from, to } = range(req);
+  const sign = "(CASE WHEN s.doc_type='return' THEN -1 ELSE 1 END)";
+  const rows = db.prepare(
+    `SELECT COALESCE(NULLIF(i.category, ''), 'Uncategorized')            AS category,
+            ROUND(SUM(${sign} * sl.qty), 3)                              AS qty_sold,
+            ROUND(SUM(${sign} * sl.line_total), 2)                       AS sales_value,
+            ROUND(SUM(${sign} * sl.qty * i.cost_price), 2)               AS cost_value,
+            ROUND(SUM(${sign} * (sl.line_total - sl.qty * i.cost_price)), 2) AS gross_profit
+     FROM sale_lines sl
+     JOIN sales s ON s.id = sl.sale_id
+     JOIN items i ON i.id = sl.item_id
+     WHERE s.tenant_id=? AND s.status='confirmed' AND s.doc_date BETWEEN ? AND ?
+     GROUP BY COALESCE(NULLIF(i.category, ''), 'Uncategorized')
+     ORDER BY gross_profit DESC`
+  ).all(req.tenant.id, from, to);
+  rows.forEach((r) => { r.margin_pct = r.sales_value ? Math.round((r.gross_profit / r.sales_value) * 1000) / 10 : 0; });
+  res.json(rows);
+});
+
 /** Dashboard rollup (powers the home screen KPIs + chart). */
 router.get("/dashboard", (req, res) => {
   const t = req.tenant.id;

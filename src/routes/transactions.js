@@ -14,18 +14,50 @@ const resolveLocation = (req) => hasLoc(req.tenant.tier) ? (Number(req.body?.loc
 const router = express.Router();
 router.use(auth);
 
+// Optional ?from / ?to (YYYY-MM-DD) filters on doc_date for the list pages —
+// same query contract as range() in reports.js. Either bound may be omitted.
+const dateFilter = (req, col) => {
+  let sql = "";
+  const args = [];
+  if (req.query.from) { sql += ` AND ${col} >= ?`; args.push(String(req.query.from)); }
+  if (req.query.to) { sql += ` AND ${col} <= ?`; args.push(String(req.query.to)); }
+  return { sql, args };
+};
+
+// Optional list filters shared by /sales and /purchases: date range plus
+// ?status, ?doc_type, and ?q (substring match on doc number or party name).
+const listFilters = (req, alias, partyCol) => {
+  const dates = dateFilter(req, `${alias}.doc_date`);
+  let sql = dates.sql;
+  const args = [...dates.args];
+  if (req.query.status) { sql += ` AND ${alias}.status = ?`; args.push(String(req.query.status)); }
+  if (req.query.doc_type) { sql += ` AND ${alias}.doc_type = ?`; args.push(String(req.query.doc_type)); }
+  if (req.query.q) { sql += ` AND (${alias}.doc_no LIKE ? OR ${partyCol} LIKE ?)`; const like = `%${String(req.query.q)}%`; args.push(like, like); }
+  return { sql, args };
+};
+
+// ?sort / ?dir list ordering. `cols` whitelists the sortable columns — unknown
+// sort values (or none) fall back to newest-first. dir is ASC only when asked.
+const listOrder = (req, cols, alias) => {
+  const col = cols[req.query.sort];
+  const dir = req.query.dir === "asc" ? "ASC" : "DESC";
+  return col ? ` ORDER BY ${col} ${dir}, ${alias}.id DESC` : ` ORDER BY ${alias}.doc_date DESC, ${alias}.id DESC`;
+};
+
 /* ─────────────────────────── PURCHASES (PU-01..06) ─────────────────────────── */
 
 router.get("/purchases", requireFeature("purchases"), (req, res) => {
-  const base = `FROM purchases p JOIN vendors v ON v.id = p.vendor_id WHERE p.tenant_id = ?`;
-  const order = " ORDER BY p.doc_date DESC, p.id DESC";
+  const f = listFilters(req, "p", "v.name");
+  const base = `FROM purchases p JOIN vendors v ON v.id = p.vendor_id WHERE p.tenant_id = ?${f.sql}`;
+  const args = [req.tenant.id, ...f.args];
+  const order = listOrder(req, { doc_no: "p.doc_no", date: "p.doc_date", party: "v.name", type: "p.doc_type", status: "p.status", tax: "p.tax_total", total: "p.grand_total" }, "p");
   if (wantsPage(req)) {
     const { page, pageSize, offset } = pageParams(req);
-    const total = db.prepare(`SELECT COUNT(*) c ${base}`).get(req.tenant.id).c;
-    const rows = db.prepare(`SELECT p.*, v.name AS vendor_name ${base}${order} LIMIT ? OFFSET ?`).all(req.tenant.id, pageSize, offset);
+    const total = db.prepare(`SELECT COUNT(*) c ${base}`).get(...args).c;
+    const rows = db.prepare(`SELECT p.*, v.name AS vendor_name ${base}${order} LIMIT ? OFFSET ?`).all(...args, pageSize, offset);
     return res.json({ rows, total, page, pageSize });
   }
-  res.json(db.prepare(`SELECT p.*, v.name AS vendor_name ${base}${order}`).all(req.tenant.id));
+  res.json(db.prepare(`SELECT p.*, v.name AS vendor_name ${base}${order}`).all(...args));
 });
 
 router.get("/purchases/:id", requireFeature("purchases"), (req, res) => {
@@ -179,15 +211,17 @@ router.put("/purchases/:id", requireFeature("purchases"), requirePermission("pur
 /* ─────────────────────────── SALES (SA-01..06) ─────────────────────────── */
 
 router.get("/sales", requireFeature("sales"), (req, res) => {
-  const base = `FROM sales s JOIN customers c ON c.id = s.customer_id WHERE s.tenant_id = ?`;
-  const order = " ORDER BY s.doc_date DESC, s.id DESC";
+  const f = listFilters(req, "s", "c.name");
+  const base = `FROM sales s JOIN customers c ON c.id = s.customer_id WHERE s.tenant_id = ?${f.sql}`;
+  const args = [req.tenant.id, ...f.args];
+  const order = listOrder(req, { doc_no: "s.doc_no", date: "s.doc_date", party: "c.name", type: "s.doc_type", status: "s.status", tax: "s.tax_total", total: "s.grand_total" }, "s");
   if (wantsPage(req)) {
     const { page, pageSize, offset } = pageParams(req);
-    const total = db.prepare(`SELECT COUNT(*) c ${base}`).get(req.tenant.id).c;
-    const rows = db.prepare(`SELECT s.*, c.name AS customer_name ${base}${order} LIMIT ? OFFSET ?`).all(req.tenant.id, pageSize, offset);
+    const total = db.prepare(`SELECT COUNT(*) c ${base}`).get(...args).c;
+    const rows = db.prepare(`SELECT s.*, c.name AS customer_name ${base}${order} LIMIT ? OFFSET ?`).all(...args, pageSize, offset);
     return res.json({ rows, total, page, pageSize });
   }
-  res.json(db.prepare(`SELECT s.*, c.name AS customer_name ${base}${order}`).all(req.tenant.id));
+  res.json(db.prepare(`SELECT s.*, c.name AS customer_name ${base}${order}`).all(...args));
 });
 
 router.get("/sales/:id", requireFeature("sales"), (req, res) => {
